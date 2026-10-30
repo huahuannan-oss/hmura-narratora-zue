@@ -284,9 +284,8 @@ async function copyWorkTask(){
 }
 function openWork(){
  if(!workAuthorized){document.getElementById('work-status').textContent='Najpierw potwierdź hasło.';return}
- const tab=window.open('https://chatgpt.com/','_blank','noopener,noreferrer');
- if(!tab)document.getElementById('work-status').textContent='Jeśli karta nie została otwarta, zezwól na wyskakujące okna albo przejdź na chatgpt.com.';
- else document.getElementById('work-status').textContent='W nowej karcie wybierz tryb Work. Dołącz PDF i skopiuj poniższe polecenie.';
+ window.open('https://chatgpt.com/','_blank','noopener,noreferrer');
+ document.getElementById('work-status').textContent='W ChatGPT wybierz Work, dołącz PDF i skopiuj polecenie. Jeśli nowa karta się nie otworzyła, zezwól na wyskakujące okna.';
 }
 document.getElementById('file').addEventListener('change',refreshWorkTask);
 refreshWorkTask();
