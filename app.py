@@ -169,34 +169,83 @@ HTML=r'''<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><meta name="
 <h2>Dodaj całą książkę PDF</h2><p class="muted">Automatyczne tworzenie wideobooków. Głos polskiego narratora Marek. Spis treści bez czytania, następnie rozdziały.</p>
 <label>Książka PDF</label><input id="file" type="file" accept=".pdf,application/pdf">
 <label>Krótki wstęp czytany przez narratora</label><textarea id="intro">Niekończąca się Księga. Oto kolejny tom podróży Zuemy i kosmicznej rasy Zue. Zapraszamy do wysłuchania opowieści.</textarea>
-<label>LEKTOR WIDEOBOOKA</label>
+<label>WYBIERZ LEKTORA DO WIDEOBOOKA</label>
 <select id="voice" onchange="chooseVoice()">
 <option value="pl-PL-MarekNeural">Marek — głos neuronowy</option>
 <option value="pl-PL-ZofiaNeural">Zofia — głos neuronowy</option>
 <option value="custom">Mój lektor — własne nagranie</option>
 </select>
-<div id="neural">
-<button type="button" class="secondary" onclick="playSample()">POSŁUCHAJ GŁOSU</button><audio controls id="sample"></audio>
-</div>
+<div id="neural"><p class="muted">Wbudowane polskie głosy neuronowe mogą automatycznie przeczytać dowolny przesłany PDF.</p></div>
+<details id="narrator-add" style="background:#09232a;border:1px solid #a5843d;border-radius:10px;padding:15px;margin:18px 0">
+<summary style="font-size:20px;cursor:pointer;color:#ffd77a;font-weight:800">➕ DODAJ LEKTORA</summary>
+<label>Imię lub nazwa nowego lektora</label>
+<input id="new-narrator-name" type="text" maxlength="70" placeholder="Np. Narrator ZUE">
+<label>Sposób czytania książki</label>
+<select id="new-narrator-mode">
+<option value="pl-PL-MarekNeural">Automatycznie: polski głos męski</option>
+<option value="pl-PL-ZofiaNeural">Automatycznie: polski głos żeński</option>
+<option value="custom">Ludzki lektor: wgram całe nagranie książki</option>
+</select>
+<button type="button" onclick="registerNarrator()">DODAJ LEKTORA DO APLIKACJI</button>
+<p id="add-narrator-status" class="muted"></p>
+<p class="muted">Dodany lektor pojawi się na liście powyżej. Automatyczne czytanie PDF działa dla głosów neuronowych. Przy lektorze ludzkim potrzebne jest nagranie całej książki, a nie fragment głosu.</p>
+</details>
 <div id="custom" style="display:none">
-<label>DODAJ LEKTORA — wgraj nagranie MP3, WAV lub M4A</label>
+<label>Wgraj pełne nagranie wybranego lektora (MP3, WAV lub M4A)</label>
 <input id="narrator-file" type="file" accept=".mp3,.wav,.m4a,audio/*">
-<button class="secondary" type="button" onclick="addNarrator()">DODAJ LEKTORA</button>
+<button class="secondary" type="button" onclick="addNarrator()">WGRAJ NAGRANIE KSIĄŻKI</button>
 <p id="narrator-result" class="muted"></p>
-<p class="muted"><b>Ważne:</b> nagranie musi zawierać CAŁĄ narrację książki (wstęp i rozdziały, bez spisu treści). Sama próbka głosu nie umożliwia automatycznego czytania całego PDF ani klonowania głosu. Strony są synchronizowane orientacyjnie.</p>
+<p class="muted"><b>Ważne:</b> wgraj pełny odczyt książki: wstęp i rozdziały bez spisu treści. Nagranie zostanie połączone ze stronami PDF, których czas jest dopasowywany orientacyjnie.</p>
 </div>
 <button id="create" onclick="upload()">UTWÓRZ WIDEOBOOK MP4</button>
 <progress id="bar" max="100" value="0"></progress><div id="status" class="status">Wybierz PDF i naciśnij UTWÓRZ WIDEOBOOK.</div><div class="links" id="links"></div>
 <p class="muted">Na darmowym serwerze generowanie bardzo długich książek może się nie udać z powodu ograniczonej pamięci i czasu. Gotowe pliki pobierz od razu: pamięć serwera nie jest trwała.</p>
 </div></main><footer>Andrzej Muller · Zuema · Studio wideobooków — bez sklepu i płatności</footer><script>
 let uploadedNarrator='';
-function chooseVoice(){let isCustom=document.getElementById('voice').value==='custom';document.getElementById('custom').style.display=isCustom?'block':'none';document.getElementById('neural').style.display=isCustom?'none':'block'}
-async function playSample(){let voice=document.getElementById('voice').value;if(voice==='custom')return;let a=document.getElementById('sample');a.src='/api/voice-sample/'+encodeURIComponent(voice);a.load();a.play().catch(()=>{})}
+const storageKey='chmura-zue-narrators-v1';
+let savedNarrators=[];
+try{savedNarrators=JSON.parse(localStorage.getItem(storageKey)||'[]');if(!Array.isArray(savedNarrators))savedNarrators=[]}catch(e){savedNarrators=[]}
+function getMode(){
+ const selected=document.getElementById('voice').value;
+ const entry=savedNarrators.find(x=>x.id===selected);
+ return entry?entry.mode:selected;
+}
+function chooseVoice(){
+ const isCustom=getMode()==='custom';
+ document.getElementById('custom').style.display=isCustom?'block':'none';
+ document.getElementById('neural').style.display=isCustom?'none':'block';
+}
+function registerNarrator(){
+ const name=document.getElementById('new-narrator-name').value.trim();
+ const mode=document.getElementById('new-narrator-mode').value;
+ const status=document.getElementById('add-narrator-status');
+ if(name.length<2){status.textContent='Wpisz imię lub nazwę lektora.';return}
+ if(savedNarrators.some(x=>x.name.toLocaleLowerCase('pl')===name.toLocaleLowerCase('pl'))){status.textContent='Lektor o takiej nazwie już istnieje.';return}
+ const entry={id:'n-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8),name:name,mode:mode};
+ savedNarrators.push(entry);
+ try{localStorage.setItem(storageKey,JSON.stringify(savedNarrators))}catch(e){}
+ const opt=new Option(name+(mode==='custom'?' — nagranie ludzkie':' — czyta PDF automatycznie'),entry.id);
+ document.getElementById('voice').add(opt);
+ document.getElementById('voice').value=entry.id;
+ chooseVoice();
+ status.textContent='Dodano lektora: '+name+'. Wybierz PDF i rozpocznij tworzenie wideobooka.';
+ document.getElementById('narrator-add').open=false;
+}
+function initNarrators(){
+ const selector=document.getElementById('voice');
+ for(const item of savedNarrators){
+  if(item&&typeof item.name==='string'&&['pl-PL-MarekNeural','pl-PL-ZofiaNeural','custom'].includes(item.mode)){
+   selector.add(new Option(item.name+(item.mode==='custom'?' — nagranie ludzkie':' — czyta PDF automatycznie'),item.id));
+  }
+ }
+ chooseVoice();
+}
+initNarrators();
 async function addNarrator(){let f=document.getElementById('narrator-file').files[0],label=document.getElementById('narrator-result');uploadedNarrator='';if(!f){label.textContent='Wybierz plik nagrania lektora';return}if(f.size>250*1024*1024){label.textContent='Nagranie przekracza 250 MB';return}
 let ext=f.name.split('.').pop().toLowerCase();label.textContent='Wgrywanie nagrania lektora...';
 try{let r=await fetch('/api/add-narrator?ext='+encodeURIComponent(ext),{method:'POST',body:f,headers:{'Content-Type':'application/octet-stream'}});let d=await r.json();if(!r.ok)throw Error(d.detail||'Błąd nagrania');uploadedNarrator=d.narrator_id;label.textContent='LEKTOR DODANY — nagranie: '+Math.round(d.duration_seconds/60)+' min. Możesz tworzyć wideobook.'}catch(e){label.textContent=e.message}}
 async function upload(){let f=document.getElementById('file').files[0];if(!f){alert('Najpierw wybierz PDF');return}if(f.size>400*1024*1024){alert('Limit pliku PDF: 400 MB');return}
-let selectedVoice=document.getElementById('voice').value;
+let selectedVoice=getMode();
 if(selectedVoice==='custom'&&!uploadedNarrator){alert('Najpierw kliknij DODAJ LEKTORA i wgraj całe nagranie książki');return}
 let btn=document.getElementById('create');btn.disabled=true;let s=document.getElementById('status');s.textContent='Przesyłanie całego PDF...';try{
 let res=await fetch('/api/upload?intro='+encodeURIComponent(document.getElementById('intro').value)+'&voice='+encodeURIComponent(selectedVoice==='custom'?'pl-PL-MarekNeural':selectedVoice)+'&narrator='+encodeURIComponent(selectedVoice==='custom'?uploadedNarrator:''),{method:'POST',body:f,headers:{'Content-Type':'application/pdf'}});let data=await res.json();if(!res.ok)throw Error(data.detail||'Błąd przesyłania');let id=data.id;
