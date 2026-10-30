@@ -3,6 +3,7 @@ from pathlib import Path
 from http.cookies import SimpleCookie
 import fitz
 from mutagen.mp3 import MP3
+from PIL import Image, ImageDraw, ImageOps
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 import uvicorn
@@ -64,6 +65,39 @@ async def speak(txt,out,voice=VOICE):
     if voice not in VOICES: raise ValueError('Nieznany głos')
     await edge_tts.Communicate(txt,voice,rate='-4%').save(str(out))
     if not out.exists() or out.stat().st_size<1000:raise RuntimeError('Nie udało się uzyskać narracji')
+def make_book_spreads(slides,durations,wd):
+    # Page 1 is a cover on the right. The following pages appear in facing pairs.
+    with Image.open(slides[0]) as sample:
+        page_w,page_h=sample.size
+    pad=max(18,round(page_w*0.055))
+    gutter=max(10,round(page_w*0.023))
+    canvas_w=page_w*2+pad*2+gutter
+    canvas_h=page_h+pad*2
+    left=(pad,pad)
+    right=(pad+page_w+gutter,pad)
+    specs=[([0],durations[0])]
+    for i in range(1,len(slides),2):
+        specs.append((list(range(i,min(i+2,len(slides)))),sum(durations[i:i+2])))
+    frames=[]
+    frame_durations=[]
+    for sequence,(page_numbers,length) in enumerate(specs):
+        frame=Image.new('RGB',(canvas_w,canvas_h),(7,27,34))
+        draw=ImageDraw.Draw(frame)
+        for x,y in (left,right):
+            draw.rectangle((x-2,y-2,x+page_w+1,y+page_h+1),fill=(246,241,229),outline=(201,161,71),width=3)
+        for index,number in enumerate(page_numbers):
+            x,y=(right if number==0 else (left if index==0 else right))
+            with Image.open(slides[number]) as source:
+                page=ImageOps.contain(source.convert('RGB'),(page_w,page_h),Image.Resampling.LANCZOS)
+                frame.paste(page,(x+(page_w-page.width)//2,y+(page_h-page.height)//2))
+        draw.line((pad+page_w+gutter//2,pad,pad+page_w+gutter//2,pad+page_h),fill=(188,144,57),width=3)
+        output=wd/f'book_{sequence:04d}.jpg'
+        frame.save(output,format='JPEG',quality=84,optimize=True)
+        frame.close()
+        frames.append(output)
+        frame_durations.append(length)
+    return frames,frame_durations
+
 def render(job,path,intro,voice=VOICE,custom_recording=None):
     if not busy.acquire(blocking=False):
         state(job,'Inny wideobook jest właśnie tworzony — spróbuj ponownie później',0);job['error']='Zajęte studio';return
@@ -126,8 +160,10 @@ def render(job,path,intro,voice=VOICE,custom_recording=None):
         audio_list=wd/'audio.txt';audio_list.write_text(''.join("file '"+p.name+"'\n" for p in audios))
         audio=wd/'narracja.mp3'
         ff(['-f','concat','-safe','0','-i',audio_list,'-c','copy',audio])
+        state(job,'Składanie stron w otwartą książkę',79)
+        slides,durations=make_book_spreads(slides,durations,wd)
         slide_list=wd/'images.txt'
-        slide_list.write_text(''.join("file '"+slides[i].name+"'\nduration "+str(round(durations[i],3))+"\n" for i in range(total))+"file '"+slides[-1].name+"'\n")
+        slide_list.write_text(''.join("file '"+slides[i].name+"'\nduration "+str(round(durations[i],3))+"\n" for i in range(len(slides)))+"file '"+slides[-1].name+"'\n")
         video=wd/'wideobook.mp4'
         ff(['-f','concat','-safe','0','-i',slide_list,'-i',audio,'-map','0:v:0','-map','1:a:0','-vsync','vfr','-vf','pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black','-c:v','libx264','-preset','ultrafast','-crf','29','-pix_fmt','yuv420p','-c:a','aac','-b:a','96k','-movflags','+faststart','-shortest',video])
         state(job,'Gotowy wideobook MP4 i MP3',100)
@@ -183,6 +219,7 @@ footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h
 
 <h2>Dodaj całą książkę PDF</h2><p class="muted">Tworzenie wideobooka tylko po ręcznym naciśnięciu przycisku. Dostęp do studia zabezpieczony hasłem.</p>
 <label>Książka PDF</label><input id="file" type="file" accept=".pdf,application/pdf">
+<p class="muted"><b>FORMAT KSIĄŻKOWY:</b> otwarta książka z dwiema stronami obok siebie. Okładka pokazuje się jako pierwsza. Narracja czyta strony po kolei, ilustracje i oryginalny PDF pozostają bez zmian.</p>
 <label>Krótki wstęp czytany przez narratora</label><textarea id="intro">Niekończąca się Księga. Oto kolejny tom podróży Zuemy i kosmicznej rasy Zue. Zapraszamy do wysłuchania opowieści.</textarea>
 <label>WYBIERZ LEKTORA DO WIDEOBOOKA</label>
 <select id="voice" onchange="chooseVoice()">
