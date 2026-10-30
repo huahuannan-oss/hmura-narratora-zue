@@ -21,9 +21,21 @@ VOICE='pl-PL-MarekNeural'
 VOICES={'pl-PL-MarekNeural':'Marek — głos polski','pl-PL-ZofiaNeural':'Zofia — głos polski'}
 
 def safe(s): return re.sub(r'[^a-zA-Z0-9_-]','',s)[:80]
-def cookie_value(): return hmac.new(SECRET.encode(),PASSWORD.encode(),'sha256').hexdigest()
+SESSION_MAX_SECONDS=2*60*60  # two hours of access after entering the owner's password
+def cookie_value(issued_at):
+    payload=f"owner-v2:{issued_at}:{PASSWORD}".encode()
+    return hmac.new(SECRET.encode(),payload,'sha256').hexdigest()
 def authorized(req):
-    return hmac.compare_digest(req.cookies.get('chmura',''),cookie_value())
+    value=req.cookies.get('chmura','')
+    try:
+        timestamp,signature=value.split('.',1)
+        if not timestamp.isdigit() or len(signature)!=64:return False
+        issued_at=int(timestamp)
+        now=int(time.time())
+        if issued_at>now or now-issued_at>SESSION_MAX_SECONDS:return False
+        return hmac.compare_digest(signature,cookie_value(issued_at))
+    except (ValueError,TypeError):
+        return False
 def auth(req):
     if not authorized(req): raise HTTPException(status_code=401,detail='Zaloguj się')
 def state(job,step,percent):
@@ -167,7 +179,7 @@ async def add_narrator(req:Request):
 HTML=r'''<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CHMURA NARRATORA ZUE</title><style>
 :root{font-family:system-ui;background:#071b22;color:#e9e4cc}body{margin:0}header{text-align:center;padding:35px 12px;border-bottom:2px solid #ad873a;color:#f8cf6d}h1{font-size:clamp(24px,5vw,44px);margin:0 0 8px}main{max-width:740px;margin:30px auto;padding:0 20px}.panel{border:1px solid #b99954;border-radius:15px;background:#112a31;padding:25px;box-shadow:0 5px 30px #0005}label{display:block;margin:15px 0 7px;font-weight:600}input,textarea,select{box-sizing:border-box;width:100%;font:inherit;background:#f9f5e9;color:#162527;padding:13px;border-radius:8px;border:0}textarea{min-height:95px}button{font:inherit;margin:18px 0 8px;background:linear-gradient(90deg,#f9df88,#bc8a34);color:#14252a;font-weight:800;border:0;border-radius:9px;padding:14px 20px;cursor:pointer;width:100%}p{line-height:1.5}.muted{color:#c3c8c4}.status{min-height:60px;background:#0b2028;border-radius:9px;padding:15px;margin-top:12px}.links a{display:block;margin:14px 0;color:#ffdc82;font-weight:700}progress{width:100%;height:24px}.secondary{background:#294953;color:#ffdd8b;border:1px solid #ac873a}audio{width:100%}select{margin:8px 0}
 
-footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h1>CHMURA NARRATORA ZUE</h1><div>PDF → NARRACJA → WIDEOBOOK MP4</div></header><main><div class="panel">
+footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h1>CHMURA NARRATORA ZUE</h1><div>PRYWATNE STUDIO · DOSTĘP NA HASŁO</div><form action="/logout" method="post" style="max-width:250px;margin:10px auto 0"><button class="secondary" type="submit" style="margin:8px 0">WYLOGUJ · ZABLOKUJ STUDIO</button></form></header><main><div class="panel">
 
 <h2>Dodaj całą książkę PDF</h2><p class="muted">Tworzenie wideobooka tylko po ręcznym naciśnięciu przycisku. Dostęp do studia zabezpieczony hasłem.</p>
 <label>Książka PDF</label><input id="file" type="file" accept=".pdf,application/pdf">
@@ -256,14 +268,14 @@ let res=await fetch('/api/upload?intro='+encodeURIComponent(document.getElementB
 let timer=setInterval(async()=>{try{let x=await (await fetch('/api/status/'+id)).json();document.getElementById('bar').value=x.progress||0;s.textContent=x.stage||'Przetwarzanie';if(x.ready||x.error){clearInterval(timer);btn.disabled=false;if(x.ready)document.getElementById('links').innerHTML='<a href="/api/download/'+id+'/mp4">POBIERZ WIDEOBOOK MP4</a><a href="/api/download/'+id+'/mp3">POBIERZ NARRACJĘ MP3</a>'}}catch(e){s.textContent='Nie można odczytać postępu: '+e.message}},2500)
 }catch(e){s.textContent='Błąd: '+e.message;btn.disabled=false}}
 </script></body></html>'''
-LOGIN='''<!doctype html><html lang="pl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="background:#09222b;color:#f7db88;font:18px system-ui;max-width:480px;margin:13vh auto;padding:24px"><h1>CHMURA NARRATORA ZUE</h1><form method="post" action="/login"><label>Hasło właściciela</label><input type="password" name="password" required style="box-sizing:border-box;width:100%;padding:14px;font-size:20px"><button style="width:100%;padding:14px;margin-top:15px;background:#f4cc76">OTWÓRZ STUDIO</button></form></body></html>'''
+LOGIN='''<!doctype html><html lang="pl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="background:#09222b;color:#f7db88;font:18px system-ui;max-width:480px;margin:13vh auto;padding:24px"><h1>CHMURA NARRATORA ZUE</h1><p>PRYWATNE STUDIO — WEJŚCIE WYŁĄCZNIE NA HASŁO WŁAŚCICIELA</p><form method="post" action="/login"><label for="password">Hasło właściciela</label><input id="password" type="password" name="password" autocomplete="current-password" required style="box-sizing:border-box;width:100%;padding:14px;font-size:20px"><button type="submit" style="width:100%;padding:14px;margin-top:15px;background:#f4cc76">OTWÓRZ STUDIO NA HASŁO</button></form></body></html>'''
 
 @app.get('/healthz')
 def health():return {'ok':True}
 @app.get('/',response_class=HTMLResponse)
 def home(req:Request):
-    if not authorized(req):return HTMLResponse(LOGIN)
-    return HTMLResponse(HTML)
+    if not authorized(req):return HTMLResponse(LOGIN,headers={'Cache-Control':'no-store'})
+    return HTMLResponse(HTML,headers={'Cache-Control':'no-store'})
 @app.post('/login')
 async def login(req:Request):
     from urllib.parse import parse_qs
@@ -271,7 +283,14 @@ async def login(req:Request):
     password=parse_qs(body).get('password',[''])[0]
     if not hmac.compare_digest(password,PASSWORD): return HTMLResponse('<h2>Niepoprawne hasło</h2><a href="/">Powrót</a>',status_code=401)
     resp=RedirectResponse('/',status_code=303)
-    resp.set_cookie('chmura',cookie_value(),httponly=True,secure=True,samesite='lax',max_age=86400)
+    issued_at=int(time.time())
+    resp.set_cookie('chmura',f"{issued_at}.{cookie_value(issued_at)}",httponly=True,secure=True,samesite='lax',path='/')
+    return resp
+
+@app.post('/logout')
+def logout():
+    resp=RedirectResponse('/',status_code=303)
+    resp.delete_cookie('chmura',path='/',httponly=True,secure=True,samesite='lax')
     return resp
 
 
