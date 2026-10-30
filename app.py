@@ -3,6 +3,7 @@ from pathlib import Path
 from http.cookies import SimpleCookie
 import fitz
 from mutagen.mp3 import MP3
+from PIL import Image, ImageDraw, ImageOps
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 import uvicorn
@@ -64,7 +65,40 @@ async def speak(txt,out,voice=VOICE):
     if voice not in VOICES: raise ValueError('Nieznany głos')
     await edge_tts.Communicate(txt,voice,rate='-4%').save(str(out))
     if not out.exists() or out.stat().st_size<1000:raise RuntimeError('Nie udało się uzyskać narracji')
-def render(job,path,intro,voice=VOICE,custom_recording=None):
+def make_book_spreads(slides,durations,wd):
+    # Page 1 is a cover on the right. The following pages appear in facing pairs.
+    with Image.open(slides[0]) as sample:
+        page_w,page_h=sample.size
+    pad=max(18,round(page_w*0.055))
+    gutter=max(10,round(page_w*0.023))
+    canvas_w=page_w*2+pad*2+gutter
+    canvas_h=page_h+pad*2
+    left=(pad,pad)
+    right=(pad+page_w+gutter,pad)
+    specs=[([0],durations[0])]
+    for i in range(1,len(slides),2):
+        specs.append((list(range(i,min(i+2,len(slides)))),sum(durations[i:i+2])))
+    frames=[]
+    frame_durations=[]
+    for sequence,(page_numbers,length) in enumerate(specs):
+        frame=Image.new('RGB',(canvas_w,canvas_h),(7,27,34))
+        draw=ImageDraw.Draw(frame)
+        for x,y in (left,right):
+            draw.rectangle((x-2,y-2,x+page_w+1,y+page_h+1),fill=(246,241,229),outline=(201,161,71),width=3)
+        for index,number in enumerate(page_numbers):
+            x,y=(right if number==0 else (left if index==0 else right))
+            with Image.open(slides[number]) as source:
+                page=ImageOps.contain(source.convert('RGB'),(page_w,page_h),Image.Resampling.LANCZOS)
+                frame.paste(page,(x+(page_w-page.width)//2,y+(page_h-page.height)//2))
+        draw.line((pad+page_w+gutter//2,pad,pad+page_w+gutter//2,pad+page_h),fill=(188,144,57),width=3)
+        output=wd/f'book_{sequence:04d}.jpg'
+        frame.save(output,format='JPEG',quality=84,optimize=True)
+        frame.close()
+        frames.append(output)
+        frame_durations.append(length)
+    return frames,frame_durations
+
+def render(job,path,intro,voice=VOICE,custom_recording=None,layout='single'):
     if not busy.acquire(blocking=False):
         state(job,'Inny wideobook jest właśnie tworzony — spróbuj ponownie później',0);job['error']='Zajęte studio';return
     try:
@@ -126,8 +160,11 @@ def render(job,path,intro,voice=VOICE,custom_recording=None):
         audio_list=wd/'audio.txt';audio_list.write_text(''.join("file '"+p.name+"'\n" for p in audios))
         audio=wd/'narracja.mp3'
         ff(['-f','concat','-safe','0','-i',audio_list,'-c','copy',audio])
+        if layout=='book':
+            state(job,'Składanie stron w otwartą książkę',79)
+            slides,durations=make_book_spreads(slides,durations,wd)
         slide_list=wd/'images.txt'
-        slide_list.write_text(''.join("file '"+slides[i].name+"'\nduration "+str(round(durations[i],3))+"\n" for i in range(total))+"file '"+slides[-1].name+"'\n")
+        slide_list.write_text(''.join("file '"+slides[i].name+"'\nduration "+str(round(durations[i],3))+"\n" for i in range(len(slides)))+"file '"+slides[-1].name+"'\n")
         video=wd/'wideobook.mp4'
         ff(['-f','concat','-safe','0','-i',slide_list,'-i',audio,'-map','0:v:0','-map','1:a:0','-vsync','vfr','-vf','pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black','-c:v','libx264','-preset','ultrafast','-crf','29','-pix_fmt','yuv420p','-c:a','aac','-b:a','96k','-movflags','+faststart','-shortest',video])
         state(job,'Gotowy wideobook MP4 i MP3',100)
@@ -183,6 +220,12 @@ footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h
 
 <h2>Dodaj całą książkę PDF</h2><p class="muted">Tworzenie wideobooka tylko po ręcznym naciśnięciu przycisku. Dostęp do studia zabezpieczony hasłem.</p>
 <label>Książka PDF</label><input id="file" type="file" accept=".pdf,application/pdf">
+<label for="layout">WYGLĄD WIDEOBOOKA</label>
+<select id="layout">
+<option value="book">FORMAT KSIĄŻKOWY — dwie strony obok siebie</option>
+<option value="single">POJEDYNCZA STRONA — dotychczasowy widok</option>
+</select>
+<p class="muted">Format książkowy pokazuje okładkę, a następnie rozkładówki dwóch stron. Narracja czyta strony po kolei. Wybór nie zmienia oryginalnego PDF.</p>
 <label>Krótki wstęp czytany przez narratora</label><textarea id="intro">Niekończąca się Księga. Oto kolejny tom podróży Zuemy i kosmicznej rasy Zue. Zapraszamy do wysłuchania opowieści.</textarea>
 <label>WYBIERZ LEKTORA DO WIDEOBOOKA</label>
 <select id="voice" onchange="chooseVoice()">
@@ -264,7 +307,7 @@ async function upload(){let f=document.getElementById('file').files[0];if(!f){al
 let selectedVoice=getMode();
 if(selectedVoice==='custom'&&!uploadedNarrator){alert('Najpierw kliknij DODAJ LEKTORA i wgraj całe nagranie książki');return}
 let btn=document.getElementById('create');btn.disabled=true;let s=document.getElementById('status');s.textContent='Przesyłanie całego PDF...';try{
-let res=await fetch('/api/upload?intro='+encodeURIComponent(document.getElementById('intro').value)+'&voice='+encodeURIComponent(selectedVoice==='custom'?'pl-PL-MarekNeural':selectedVoice)+'&narrator='+encodeURIComponent(selectedVoice==='custom'?uploadedNarrator:''),{method:'POST',body:f,headers:{'Content-Type':'application/pdf'}});let data=await res.json();if(!res.ok)throw Error(data.detail||'Błąd przesyłania');let id=data.id;
+let res=await fetch('/api/upload?intro='+encodeURIComponent(document.getElementById('intro').value)+'&voice='+encodeURIComponent(selectedVoice==='custom'?'pl-PL-MarekNeural':selectedVoice)+'&narrator='+encodeURIComponent(selectedVoice==='custom'?uploadedNarrator:'')+'&layout='+encodeURIComponent(document.getElementById('layout').value),{method:'POST',body:f,headers:{'Content-Type':'application/pdf'}});let data=await res.json();if(!res.ok)throw Error(data.detail||'Błąd przesyłania');let id=data.id;
 let timer=setInterval(async()=>{try{let x=await (await fetch('/api/status/'+id)).json();document.getElementById('bar').value=x.progress||0;s.textContent=x.stage||'Przetwarzanie';if(x.ready||x.error){clearInterval(timer);btn.disabled=false;if(x.ready)document.getElementById('links').innerHTML='<a href="/api/download/'+id+'/mp4">POBIERZ WIDEOBOOK MP4</a><a href="/api/download/'+id+'/mp3">POBIERZ NARRACJĘ MP3</a>'}}catch(e){s.textContent='Nie można odczytać postępu: '+e.message}},2500)
 }catch(e){s.textContent='Błąd: '+e.message;btn.disabled=false}}
 </script></body></html>'''
@@ -295,9 +338,10 @@ def logout():
 
 
 @app.post('/api/upload')
-async def upload(req:Request,intro:str='',voice:str=VOICE,narrator:str=''):
+async def upload(req:Request,intro:str='',voice:str=VOICE,narrator:str='',layout:str='book'):
     auth(req)
     if voice not in VOICES:raise HTTPException(400,'Nieznany głos narratora')
+    if layout not in ('single','book'):raise HTTPException(400,'Nieznany format wideobooka')
     custom_path=None
     if narrator:
         if not re.fullmatch('[a-f0-9]{32}',narrator):raise HTTPException(400,'Niepoprawny identyfikator lektora')
@@ -322,7 +366,7 @@ async def upload(req:Request,intro:str='',voice:str=VOICE,narrator:str=''):
         path.unlink(missing_ok=True);raise HTTPException(400,'Niepoprawny PDF: '+str(e))
     job={'id':name,'stage':'Przygotowanie książki','progress':0,'pages':count,'ready':False}
     jobs[name]=job
-    threading.Thread(target=render,args=(job,path,intro[:700],voice,custom_path),daemon=True).start()
+    threading.Thread(target=render,args=(job,path,intro[:700],voice,custom_path,layout),daemon=True).start()
     return {'id':name,'pages':count}
 @app.get('/api/status/{job_id}')
 def status(req:Request,job_id:str):
