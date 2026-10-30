@@ -4,7 +4,7 @@ from http.cookies import SimpleCookie
 import fitz
 from mutagen.mp3 import MP3
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 import uvicorn
 import edge_tts
 
@@ -166,31 +166,10 @@ async def add_narrator(req:Request):
 
 HTML=r'''<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CHMURA NARRATORA ZUE</title><style>
 :root{font-family:system-ui;background:#071b22;color:#e9e4cc}body{margin:0}header{text-align:center;padding:35px 12px;border-bottom:2px solid #ad873a;color:#f8cf6d}h1{font-size:clamp(24px,5vw,44px);margin:0 0 8px}main{max-width:740px;margin:30px auto;padding:0 20px}.panel{border:1px solid #b99954;border-radius:15px;background:#112a31;padding:25px;box-shadow:0 5px 30px #0005}label{display:block;margin:15px 0 7px;font-weight:600}input,textarea,select{box-sizing:border-box;width:100%;font:inherit;background:#f9f5e9;color:#162527;padding:13px;border-radius:8px;border:0}textarea{min-height:95px}button{font:inherit;margin:18px 0 8px;background:linear-gradient(90deg,#f9df88,#bc8a34);color:#14252a;font-weight:800;border:0;border-radius:9px;padding:14px 20px;cursor:pointer;width:100%}p{line-height:1.5}.muted{color:#c3c8c4}.status{min-height:60px;background:#0b2028;border-radius:9px;padding:15px;margin-top:12px}.links a{display:block;margin:14px 0;color:#ffdc82;font-weight:700}progress{width:100%;height:24px}.secondary{background:#294953;color:#ffdd8b;border:1px solid #ac873a}audio{width:100%}select{margin:8px 0}
-.work-panel{background:#18383b;border:1px solid #d6ae59;border-radius:12px;padding:20px;margin-bottom:22px}
-.work-panel h2{color:#ffdf92;margin:0 0 12px}
-.work-panel p{margin:9px 0}
-.work-panel textarea{font-size:14px;min-height:178px;line-height:1.5;resize:vertical}
-.work-panel button{margin:8px 0}
-.work-panel [hidden]{display:none}
-.work-panel small{font-size:13px}
+
 footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h1>CHMURA NARRATORA ZUE</h1><div>PDF → NARRACJA → WIDEOBOOK MP4</div></header><main><div class="panel">
 
-<section class="work-panel" aria-label="ChatGPT Work do produkcji wideobooków">
-<h2>CHATGPT WORK — ASYSTENT WIDEOBOOKÓW</h2>
-<p>Opcja otwiera ChatGPT, gdzie możesz wybrać tryb <b>Work</b> i dołączyć PDF. Work może obsłużyć studio w swojej przeglądarce.</p>
-<label for="work-password">Potwierdź hasło właściciela chmury</label>
-<input id="work-password" type="password" autocomplete="off" placeholder="Wpisz hasło właściciela">
-<button type="button" id="work-confirm" onclick="confirmWorkPassword()">POTWIERDŹ HASŁO</button>
-<div id="work-actions" hidden>
-<button type="button" onclick="openWork()">OTWÓRZ CHATGPT WORK</button>
-<button type="button" class="secondary" onclick="copyWorkTask()">KOPIUJ POLECENIE DLA WORK</button>
-<label for="work-task">Polecenie do wklejenia w ChatGPT Work</label>
-<textarea id="work-task" readonly spellcheck="false"></textarea>
-</div>
-<p id="work-status" class="muted" role="status">Po potwierdzeniu hasła pojawi się przycisk otwierający ChatGPT.</p>
-<p class="muted"><small>Hasło jest sprawdzane na serwerze, nie trafia do ChatGPT ani do polecenia. To skrót do Work, nie wbudowany agent. PDF trzeba dołączyć do zadania Work.</small></p>
-</section>
-<h2>Dodaj całą książkę PDF</h2><p class="muted">Automatyczne tworzenie wideobooków. Głos polskiego narratora Marek. Spis treści bez czytania, następnie rozdziały.</p>
+<h2>Dodaj całą książkę PDF</h2><p class="muted">Tworzenie wideobooka tylko po ręcznym naciśnięciu przycisku. Dostęp do studia zabezpieczony hasłem.</p>
 <label>Książka PDF</label><input id="file" type="file" accept=".pdf,application/pdf">
 <label>Krótki wstęp czytany przez narratora</label><textarea id="intro">Niekończąca się Księga. Oto kolejny tom podróży Zuemy i kosmicznej rasy Zue. Zapraszamy do wysłuchania opowieści.</textarea>
 <label>WYBIERZ LEKTORA DO WIDEOBOOKA</label>
@@ -226,69 +205,6 @@ footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h
 <p class="muted">Na darmowym serwerze generowanie bardzo długich książek może się nie udać z powodu ograniczonej pamięci i czasu. Gotowe pliki pobierz od razu: pamięć serwera nie jest trwała.</p>
 </div></main><footer>Andrzej Muller · Zuema · Studio wideobooków — bez sklepu i płatności</footer><script>
 
-let workAuthorized=false;
-function buildWorkTask(){
- const file=document.getElementById('file').files[0];
- const bookName=file?file.name:'Niekończąca się Księga — Część VII, Tom II';
- return [
-  'Użyj przeglądarki w trybie ChatGPT Work.',
-  'Otwórz https://chmura-narratora-zue.onrender.com/.',
-  'Jeśli potrzebne jest hasło, poproś mnie o bezpieczne zalogowanie w przeglądarce Work. Nie proś o hasło na czacie.',
-  'Wgraj załączony do tego zadania PDF: '+bookName+'. Jeśli PDF nie jest załączony, poproś o jego dołączenie.',
-  'Ustaw narratora Marek — głos polski. Zachowaj kolejność stron i ilustracje. Spis treści pokaż bez narracji.',
-  'Uruchom tworzenie całego wideobooka MP4 w tej chmurze. Monitoruj status i błędy.',
-  'Dopiero po ukończeniu pobierz gotowy plik MP4 i narrację MP3, jeśli dostępna. Przekaż pliki lub zweryfikowane linki. Nie deklaruj sukcesu przed sprawdzeniem wyniku.'
- ].join(String.fromCharCode(10));
-}
-function refreshWorkTask(){
- const area=document.getElementById('work-task');
- if(area)area.value=buildWorkTask();
-}
-async function confirmWorkPassword(){
- const field=document.getElementById('work-password');
- const btn=document.getElementById('work-confirm');
- const status=document.getElementById('work-status');
- const password=field.value;
- if(!password){status.textContent='Wpisz hasło właściciela, aby potwierdzić dostęp.';return}
- btn.disabled=true;
- status.textContent='Sprawdzanie hasła na serwerze...';
- try{
-  const r=await fetch('/api/work/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:password}),cache:'no-store',credentials:'same-origin'});
-  if(!r.ok)throw Error(r.status===403?'Niepoprawne hasło.':'Nie udało się potwierdzić hasła.');
-  workAuthorized=true;
-  field.value='';
-  field.style.display='none';
-  btn.style.display='none';
-  document.querySelector('label[for="work-password"]').style.display='none';
-  document.getElementById('work-actions').hidden=false;
-  refreshWorkTask();
-  status.textContent='Hasło potwierdzone. Otwórz ChatGPT, wybierz Work, dołącz PDF i wklej polecenie.';
- }catch(e){
-  field.value='';
-  status.textContent=e.message;
- }finally{btn.disabled=false}
-}
-async function copyWorkTask(){
- const status=document.getElementById('work-status');
- if(!workAuthorized){status.textContent='Najpierw potwierdź hasło.';return}
- refreshWorkTask();
- const area=document.getElementById('work-task');
- try{
-  if(!navigator.clipboard || !navigator.clipboard.writeText)throw Error('Schowek niedostępny');
-  await navigator.clipboard.writeText(area.value);
-  status.textContent='Polecenie skopiowane. W Work dołącz PDF i wklej polecenie.';
- }catch(e){
-  area.focus();area.select();
-  status.textContent='Polecenie zaznaczone. Skopiuj je klawiszami Ctrl+C, potem wklej w ChatGPT Work.';
- }
-}
-function openWork(){
- if(!workAuthorized){document.getElementById('work-status').textContent='Najpierw potwierdź hasło.';return}
- window.open('https://chatgpt.com/','_blank','noopener,noreferrer');
- document.getElementById('work-status').textContent='W ChatGPT wybierz Work, dołącz PDF i skopiuj polecenie. Jeśli nowa karta się nie otworzyła, zezwól na wyskakujące okna.';
-}
-document.getElementById('file').addEventListener('change',refreshWorkTask);
-refreshWorkTask();
 let uploadedNarrator='';
 const storageKey='chmura-zue-narrators-v1';
 let savedNarrators=[];
@@ -358,19 +274,6 @@ async def login(req:Request):
     resp.set_cookie('chmura',cookie_value(),httponly=True,secure=True,samesite='lax',max_age=86400)
     return resp
 
-@app.post('/api/work/confirm')
-async def confirm_work_password(req:Request):
-    auth(req)
-    try:
-        data=await req.json()
-    except (ValueError, UnicodeDecodeError):
-        raise HTTPException(400,'Niepoprawne żądanie')
-    supplied=data.get('password') if isinstance(data,dict) else None
-    if not isinstance(supplied,str) or len(supplied)>4096:
-        raise HTTPException(400,'Wymagane poprawne hasło')
-    if not hmac.compare_digest(supplied,PASSWORD):
-        raise HTTPException(403,'Niepoprawne hasło')
-    return JSONResponse({'confirmed':True},headers={'Cache-Control':'no-store'})
 
 @app.post('/api/upload')
 async def upload(req:Request,intro:str='',voice:str=VOICE,narrator:str=''):
