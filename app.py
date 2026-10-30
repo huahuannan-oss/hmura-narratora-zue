@@ -44,6 +44,35 @@ def ff(args):
     p=subprocess.run(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y']+list(map(str,args)),capture_output=True,text=True)
     if p.returncode: raise RuntimeError(p.stderr[-900:])
 
+def ff_video(args,job,expected_seconds):
+    # Show actual encoder media-time progress instead of staying at 78%.
+    command=['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-stats_period','2','-progress','pipe:1','-nostats','-y']+list(map(str,args))
+    p=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
+    last_output=[]
+    try:
+        state(job,'Kodowanie wideobooka MP4 — 0%',80)
+        for raw in p.stdout:
+            line=raw.strip()
+            if line.startswith(('out_time_us=','out_time_ms=')) and expected_seconds>0:
+                try:
+                    seconds=max(0,int(line.split('=',1)[1])/1_000_000)
+                    percent=min(99,round(100*seconds/expected_seconds))
+                    state(job,f'Kodowanie wideobooka MP4 — {percent}% filmu',80+min(18,round(18*percent/100)))
+                except (ValueError,OverflowError):
+                    pass
+            elif line=='progress=end':
+                state(job,'Finalizowanie pliku MP4',99)
+            elif line:
+                last_output.append(line)
+                if len(last_output)>40:last_output.pop(0)
+        exit_code=p.wait()
+        if exit_code:
+            raise RuntimeError(('FFmpeg: '+'; '.join(last_output))[-900:] or f'Błąd kodowania MP4, kod {exit_code}')
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait()
+
 def clean_text(page):
     blocks=page.get_text('blocks')
     text='\n'.join(b[4] for b in sorted(blocks,key=lambda b:(b[1],b[0])) if len(b)>4 and isinstance(b[4],str))
@@ -129,7 +158,7 @@ def render(job,path,intro,voice=VOICE,custom_recording=None):
         slide_list=wd/'images.txt'
         slide_list.write_text(''.join("file '"+slides[i].name+"'\nduration "+str(round(durations[i],3))+"\n" for i in range(total))+"file '"+slides[-1].name+"'\n")
         video=wd/'wideobook.mp4'
-        ff(['-f','concat','-safe','0','-i',slide_list,'-i',audio,'-map','0:v:0','-map','1:a:0','-vsync','vfr','-vf','pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black','-c:v','libx264','-preset','ultrafast','-crf','29','-pix_fmt','yuv420p','-c:a','aac','-b:a','96k','-movflags','+faststart','-shortest',video])
+        ff_video(['-f','concat','-safe','0','-i',slide_list,'-i',audio,'-map','0:v:0','-map','1:a:0','-vsync','vfr','-vf','pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black','-c:v','libx264','-preset','ultrafast','-crf','29','-pix_fmt','yuv420p','-c:a','aac','-b:a','96k','-movflags','+faststart','-shortest',video],job,sum(durations))
         state(job,'Gotowy wideobook MP4 i MP3',100)
         job['ready']=True
     except Exception as e:
