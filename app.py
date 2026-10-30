@@ -18,6 +18,7 @@ lock=threading.Lock()
 busy=threading.Semaphore(1)
 MAX_SIZE=400*1024*1024
 VOICE='pl-PL-MarekNeural'
+VOICES={'pl-PL-MarekNeural':'Marek — głos polski','pl-PL-ZofiaNeural':'Zofia — głos polski'}
 
 def safe(s): return re.sub(r'[^a-zA-Z0-9_-]','',s)[:80]
 def cookie_value(): return hmac.new(SECRET.encode(),PASSWORD.encode(),'sha256').hexdigest()
@@ -46,11 +47,12 @@ def clean_text(page):
         result.append(line)
     return ' '.join(result)
 
-async def speak(txt,out):
-    # Edge TTS is an online service; failures must be clearly reported.
-    await edge_tts.Communicate(txt,VOICE,rate='-4%').save(str(out))
+async def speak(txt,out,voice=VOICE):
+    # Naturalnie brzmiący głos neuronowy online; nie jest żywym lektorem.
+    if voice not in VOICES: raise ValueError('Nieznany głos')
+    await edge_tts.Communicate(txt,voice,rate='-4%').save(str(out))
     if not out.exists() or out.stat().st_size<1000:raise RuntimeError('Nie udało się uzyskać narracji')
-def render(job,path,intro):
+def render(job,path,intro,voice=VOICE,custom_recording=None):
     if not busy.acquire(blocking=False):
         state(job,'Inny wideobook jest właśnie tworzony — spróbuj ponownie później',0);job['error']='Zajęte studio';return
     try:
@@ -73,17 +75,33 @@ def render(job,path,intro):
             else: spoken=clean_text(page)
             texts.append(spoken[:5000])
         pdf.close()
+        if custom_recording:
+            probe=subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1',str(custom_recording)],capture_output=True,text=True,timeout=25)
+            if probe.returncode: raise RuntimeError('Nie można odczytać czasu nagrania lektora')
+            full_duration=float(probe.stdout.strip())
+            spoken_total=sum(len(t.split()) for t in texts if t)
+            if spoken_total==0: raise RuntimeError('Brak tekstu w PDF')
+            pointer=0.0
+            last_spoken=max(i for i,t in enumerate(texts) if t)
         # split passages to avoid very large requests
         for i,spoken in enumerate(texts):
             state(job,'Nagrywanie polskiego narratora: strona '+str(i+1)+' z '+str(total),round(10+65*i/total))
             dest=wd/f'a{i:04d}.mp3'
-            if spoken:
+            if spoken and custom_recording:
+                # Nagrany lektor czyta całą książkę; czasy stron szacowane długością tekstu.
+                part=(full_duration-pointer if i==last_spoken else full_duration*len(spoken.split())/spoken_total)
+                part=max(0.05,part)
+                ff(['-ss',str(round(pointer,3)),'-t',str(round(part,3)),'-i',custom_recording,
+                    '-vn','-ar','24000','-ac','1','-c:a','libmp3lame','-b:a','64k',dest])
+                pointer+=part
+                dur=max(0.2,MP3(dest).info.length)
+            elif spoken:
                 pieces=[spoken[j:j+1600] for j in range(0,len(spoken),1600)]
-                if len(pieces)==1: asyncio.run(speak(pieces[0],dest))
+                if len(pieces)==1: asyncio.run(speak(pieces[0],dest,voice))
                 else:
                     split=[]
                     for j,piece in enumerate(pieces):
-                        p=wd/f'p{i:04d}_{j}.mp3';asyncio.run(speak(piece,p));split.append(p)
+                        p=wd/f'p{i:04d}_{j}.mp3';asyncio.run(speak(piece,p,voice));split.append(p)
                     lst=wd/f'm{i:04d}.txt'
                     lst.write_text(''.join("file '"+p.name+"'\n" for p in split))
                     ff(['-f','concat','-safe','0','-i',lst,'-c','copy',dest])
@@ -106,18 +124,82 @@ def render(job,path,intro):
         job['error']=str(e);state(job,'Błąd: '+str(e),job.get('progress',0))
     finally: busy.release()
 
+@app.get('/api/narrators')
+def narrators(req:Request):
+    auth(req)
+    return VOICES
+
+@app.get('/api/voice-sample/{voice}')
+async def voice_sample(req:Request,voice:str):
+    auth(req)
+    if voice not in VOICES:raise HTTPException(400,'Nieznany głos')
+    sample=ROOT/('sample_'+voice+'.mp3')
+    if not sample.exists() or sample.stat().st_size<1000:
+        try:
+            await speak('Witam w Chmurze Narratora Zue. Posłuchaj próbki mojego głosu.',sample,voice)
+        except Exception as e:raise HTTPException(502,'Próbka głosu niedostępna: '+str(e))
+    return FileResponse(sample,media_type='audio/mpeg')
+
+@app.post('/api/add-narrator')
+async def add_narrator(req:Request):
+    auth(req)
+    ext=req.query_params.get('ext','').lower()
+    if ext not in ('mp3','wav','m4a'):raise HTTPException(400,'Wybierz MP3, WAV lub M4A')
+    token=uuid.uuid4().hex
+    directory=ROOT/'narrators';directory.mkdir(exist_ok=True)
+    dest=directory/(token+'.audio')
+    size=0
+    try:
+        with dest.open('wb') as out:
+            async for chunk in req.stream():
+                size+=len(chunk)
+                if size>250*1024*1024:raise HTTPException(413,'Limit nagrania 250 MB')
+                out.write(chunk)
+        probe=subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1',str(dest)],capture_output=True,text=True,timeout=25)
+        if probe.returncode or not probe.stdout.strip():raise HTTPException(400,'Niepoprawne nagranie audio')
+        duration=float(probe.stdout.strip())
+        if duration<3 or duration>12*3600:raise HTTPException(400,'Nagranie musi trwać od 3 sekund do 12 godzin')
+        return {'narrator_id':token,'duration_seconds':round(duration,1)}
+    except:
+        dest.unlink(missing_ok=True)
+        raise
+
 HTML=r'''<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CHMURA NARRATORA ZUE</title><style>
-:root{font-family:system-ui;background:#071b22;color:#e9e4cc}body{margin:0}header{text-align:center;padding:35px 12px;border-bottom:2px solid #ad873a;color:#f8cf6d}h1{font-size:clamp(24px,5vw,44px);margin:0 0 8px}main{max-width:740px;margin:30px auto;padding:0 20px}.panel{border:1px solid #b99954;border-radius:15px;background:#112a31;padding:25px;box-shadow:0 5px 30px #0005}label{display:block;margin:15px 0 7px;font-weight:600}input,textarea{box-sizing:border-box;width:100%;font:inherit;background:#f9f5e9;color:#162527;padding:13px;border-radius:8px;border:0}textarea{min-height:95px}button{font:inherit;margin:18px 0 8px;background:linear-gradient(90deg,#f9df88,#bc8a34);color:#14252a;font-weight:800;border:0;border-radius:9px;padding:14px 20px;cursor:pointer;width:100%}p{line-height:1.5}.muted{color:#c3c8c4}.status{min-height:60px;background:#0b2028;border-radius:9px;padding:15px;margin-top:12px}.links a{display:block;margin:14px 0;color:#ffdc82;font-weight:700}progress{width:100%;height:24px}footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h1>CHMURA NARRATORA ZUE</h1><div>PDF → NARRACJA → WIDEOBOOK MP4</div></header><main><div class="panel">
+:root{font-family:system-ui;background:#071b22;color:#e9e4cc}body{margin:0}header{text-align:center;padding:35px 12px;border-bottom:2px solid #ad873a;color:#f8cf6d}h1{font-size:clamp(24px,5vw,44px);margin:0 0 8px}main{max-width:740px;margin:30px auto;padding:0 20px}.panel{border:1px solid #b99954;border-radius:15px;background:#112a31;padding:25px;box-shadow:0 5px 30px #0005}label{display:block;margin:15px 0 7px;font-weight:600}input,textarea,select{box-sizing:border-box;width:100%;font:inherit;background:#f9f5e9;color:#162527;padding:13px;border-radius:8px;border:0}textarea{min-height:95px}button{font:inherit;margin:18px 0 8px;background:linear-gradient(90deg,#f9df88,#bc8a34);color:#14252a;font-weight:800;border:0;border-radius:9px;padding:14px 20px;cursor:pointer;width:100%}p{line-height:1.5}.muted{color:#c3c8c4}.status{min-height:60px;background:#0b2028;border-radius:9px;padding:15px;margin-top:12px}.links a{display:block;margin:14px 0;color:#ffdc82;font-weight:700}progress{width:100%;height:24px}.secondary{background:#294953;color:#ffdd8b;border:1px solid #ac873a}audio{width:100%}select{margin:8px 0}footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h1>CHMURA NARRATORA ZUE</h1><div>PDF → NARRACJA → WIDEOBOOK MP4</div></header><main><div class="panel">
 <h2>Dodaj całą książkę PDF</h2><p class="muted">Automatyczne tworzenie wideobooków. Głos polskiego narratora Marek. Spis treści bez czytania, następnie rozdziały.</p>
 <label>Książka PDF</label><input id="file" type="file" accept=".pdf,application/pdf">
 <label>Krótki wstęp czytany przez narratora</label><textarea id="intro">Niekończąca się Księga. Oto kolejny tom podróży Zuemy i kosmicznej rasy Zue. Zapraszamy do wysłuchania opowieści.</textarea>
+<label>LEKTOR WIDEOBOOKA</label>
+<select id="voice" onchange="chooseVoice()">
+<option value="pl-PL-MarekNeural">Marek — głos neuronowy</option>
+<option value="pl-PL-ZofiaNeural">Zofia — głos neuronowy</option>
+<option value="custom">Mój lektor — własne nagranie</option>
+</select>
+<div id="neural">
+<button type="button" class="secondary" onclick="playSample()">POSŁUCHAJ GŁOSU</button><audio controls id="sample"></audio>
+</div>
+<div id="custom" style="display:none">
+<label>DODAJ LEKTORA — wgraj nagranie MP3, WAV lub M4A</label>
+<input id="narrator-file" type="file" accept=".mp3,.wav,.m4a,audio/*">
+<button class="secondary" type="button" onclick="addNarrator()">DODAJ LEKTORA</button>
+<p id="narrator-result" class="muted"></p>
+<p class="muted"><b>Ważne:</b> nagranie musi zawierać CAŁĄ narrację książki (wstęp i rozdziały, bez spisu treści). Sama próbka głosu nie umożliwia automatycznego czytania całego PDF ani klonowania głosu. Strony są synchronizowane orientacyjnie.</p>
+</div>
 <button id="create" onclick="upload()">UTWÓRZ WIDEOBOOK MP4</button>
 <progress id="bar" max="100" value="0"></progress><div id="status" class="status">Wybierz PDF i naciśnij UTWÓRZ WIDEOBOOK.</div><div class="links" id="links"></div>
 <p class="muted">Na darmowym serwerze generowanie bardzo długich książek może się nie udać z powodu ograniczonej pamięci i czasu. Gotowe pliki pobierz od razu: pamięć serwera nie jest trwała.</p>
 </div></main><footer>Andrzej Muller · Zuema · Studio wideobooków — bez sklepu i płatności</footer><script>
+let uploadedNarrator='';
+function chooseVoice(){let isCustom=document.getElementById('voice').value==='custom';document.getElementById('custom').style.display=isCustom?'block':'none';document.getElementById('neural').style.display=isCustom?'none':'block'}
+async function playSample(){let voice=document.getElementById('voice').value;if(voice==='custom')return;let a=document.getElementById('sample');a.src='/api/voice-sample/'+encodeURIComponent(voice);a.load();a.play().catch(()=>{})}
+async function addNarrator(){let f=document.getElementById('narrator-file').files[0],label=document.getElementById('narrator-result');uploadedNarrator='';if(!f){label.textContent='Wybierz plik nagrania lektora';return}if(f.size>250*1024*1024){label.textContent='Nagranie przekracza 250 MB';return}
+let ext=f.name.split('.').pop().toLowerCase();label.textContent='Wgrywanie nagrania lektora...';
+try{let r=await fetch('/api/add-narrator?ext='+encodeURIComponent(ext),{method:'POST',body:f,headers:{'Content-Type':'application/octet-stream'}});let d=await r.json();if(!r.ok)throw Error(d.detail||'Błąd nagrania');uploadedNarrator=d.narrator_id;label.textContent='LEKTOR DODANY — nagranie: '+Math.round(d.duration_seconds/60)+' min. Możesz tworzyć wideobook.'}catch(e){label.textContent=e.message}}
 async function upload(){let f=document.getElementById('file').files[0];if(!f){alert('Najpierw wybierz PDF');return}if(f.size>400*1024*1024){alert('Limit pliku PDF: 400 MB');return}
+let selectedVoice=document.getElementById('voice').value;
+if(selectedVoice==='custom'&&!uploadedNarrator){alert('Najpierw kliknij DODAJ LEKTORA i wgraj całe nagranie książki');return}
 let btn=document.getElementById('create');btn.disabled=true;let s=document.getElementById('status');s.textContent='Przesyłanie całego PDF...';try{
-let res=await fetch('/api/upload?intro='+encodeURIComponent(document.getElementById('intro').value),{method:'POST',body:f,headers:{'Content-Type':'application/pdf'}});let data=await res.json();if(!res.ok)throw Error(data.detail||'Błąd przesyłania');let id=data.id;
+let res=await fetch('/api/upload?intro='+encodeURIComponent(document.getElementById('intro').value)+'&voice='+encodeURIComponent(selectedVoice==='custom'?'pl-PL-MarekNeural':selectedVoice)+'&narrator='+encodeURIComponent(selectedVoice==='custom'?uploadedNarrator:''),{method:'POST',body:f,headers:{'Content-Type':'application/pdf'}});let data=await res.json();if(!res.ok)throw Error(data.detail||'Błąd przesyłania');let id=data.id;
 let timer=setInterval(async()=>{try{let x=await (await fetch('/api/status/'+id)).json();document.getElementById('bar').value=x.progress||0;s.textContent=x.stage||'Przetwarzanie';if(x.ready||x.error){clearInterval(timer);btn.disabled=false;if(x.ready)document.getElementById('links').innerHTML='<a href="/api/download/'+id+'/mp4">POBIERZ WIDEOBOOK MP4</a><a href="/api/download/'+id+'/mp3">POBIERZ NARRACJĘ MP3</a>'}}catch(e){s.textContent='Nie można odczytać postępu: '+e.message}},2500)
 }catch(e){s.textContent='Błąd: '+e.message;btn.disabled=false}}
 </script></body></html>'''
@@ -139,8 +221,14 @@ async def login(req:Request):
     resp.set_cookie('chmura',cookie_value(),httponly=True,secure=True,samesite='lax',max_age=86400)
     return resp
 @app.post('/api/upload')
-async def upload(req:Request,intro:str=''):
+async def upload(req:Request,intro:str='',voice:str=VOICE,narrator:str=''):
     auth(req)
+    if voice not in VOICES:raise HTTPException(400,'Nieznany głos narratora')
+    custom_path=None
+    if narrator:
+        if not re.fullmatch('[a-f0-9]{32}',narrator):raise HTTPException(400,'Niepoprawny identyfikator lektora')
+        custom_path=ROOT/'narrators'/(narrator+'.audio')
+        if not custom_path.is_file():raise HTTPException(400,'Brak pliku lektora')
     if req.headers.get('content-type')!='application/pdf':raise HTTPException(400,'Dodaj plik PDF')
     name=uuid.uuid4().hex
     project=ROOT/name;project.mkdir()
@@ -160,7 +248,7 @@ async def upload(req:Request,intro:str=''):
         path.unlink(missing_ok=True);raise HTTPException(400,'Niepoprawny PDF: '+str(e))
     job={'id':name,'stage':'Przygotowanie książki','progress':0,'pages':count,'ready':False}
     jobs[name]=job
-    threading.Thread(target=render,args=(job,path,intro[:700]),daemon=True).start()
+    threading.Thread(target=render,args=(job,path,intro[:700],voice,custom_path),daemon=True).start()
     return {'id':name,'pages':count}
 @app.get('/api/status/{job_id}')
 def status(req:Request,job_id:str):
