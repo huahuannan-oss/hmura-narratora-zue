@@ -329,6 +329,18 @@ function initNarrators(){
  chooseVoice();
 }
 initNarrators();
+// Dla Tomu II wystarczy wskazać PDF: generowanie startuje automatycznie głosem Marka.
+document.getElementById('file').addEventListener('change',async function(){
+ const pdf=this.files[0];
+ if(!pdf)return;
+ if(!/Tom[ _-]*II(?:[^IVX]|$)/i.test(pdf.name))return;
+ const voiceSelector=document.getElementById('voice');
+ voiceSelector.value='pl-PL-MarekNeural';
+ chooseVoice();
+ document.getElementById('intro').value='Niekończąca się Księga. Część siódma. Tom drugi. Księga wyewoluowania Zue do kosmicznej rasy. Autor Andrzej Muller, Zuema. Rozpoczynamy opowieść o nowej aglomeracji na planecie Zuema, Arkadii o dwóch koronach i drodze świetlistych Zue.';
+ document.getElementById('status').textContent='Tom II wybrany. Automatyczne przesyłanie PDF do chmury i uruchamianie narratora Marka...';
+ await upload();
+});
 async function addNarrator(){let f=document.getElementById('narrator-file').files[0],label=document.getElementById('narrator-result');uploadedNarrator='';if(!f){label.textContent='Wybierz plik nagrania lektora';return}if(f.size>250*1024*1024){label.textContent='Nagranie przekracza 250 MB';return}
 let ext=f.name.split('.').pop().toLowerCase();label.textContent='Wgrywanie nagrania lektora...';
 try{let r=await fetch('/api/add-narrator?ext='+encodeURIComponent(ext),{method:'POST',body:f,headers:{'Content-Type':'application/octet-stream'}});let d=await r.json();if(!r.ok)throw Error(d.detail||'Błąd nagrania');uploadedNarrator=d.narrator_id;label.textContent='LEKTOR DODANY — nagranie: '+Math.round(d.duration_seconds/60)+' min. Możesz tworzyć wideobook.'}catch(e){label.textContent=e.message}}
