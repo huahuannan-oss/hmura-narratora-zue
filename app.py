@@ -1,4 +1,4 @@
-import os, io, re, json, time, uuid, asyncio, threading, subprocess, secrets, hmac
+import os, io, re, json, time, uuid, asyncio, threading, subprocess, secrets, hmac, gc
 from pathlib import Path
 from http.cookies import SimpleCookie
 import fitz
@@ -42,7 +42,7 @@ def auth(req):
 def state(job,step,percent):
     job.update(stage=step,progress=percent)
 def ff(args):
-    p=subprocess.run(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y']+list(map(str,args)),capture_output=True,text=True)
+    p=subprocess.run(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y','-filter_threads','1','-filter_complex_threads','1']+list(map(str,args)),capture_output=True,text=True)
     if p.returncode: raise RuntimeError(p.stderr[-900:])
 
 def clean_text(page):
@@ -116,8 +116,9 @@ def render(job,path,intro,voice=VOICE,custom_recording=None,opening_page=None):
         for i in range(total):
             page=pdf[i]
             img=wd/f'{i:04d}.jpg'
-            pix=page.get_pixmap(matrix=fitz.Matrix(1.25,1.25),alpha=False)
+            pix=page.get_pixmap(matrix=fitz.Matrix(1.15,1.15),alpha=False)
             pix.save(img,jpg_quality=82)
+            del pix  # free PDF page bitmap before rendering the next page
             slides.append(img)
             if i==0: spoken=''
             elif i==1: spoken=intro.strip() or 'Niekończąca się Księga. Część siódma. Tom drugi. Zapraszamy do świata Zuemy i kosmicznej rasy Zue.'
@@ -169,12 +170,14 @@ def render(job,path,intro,voice=VOICE,custom_recording=None,opening_page=None):
         slide_list=wd/'images.txt'
         slide_list.write_text(''.join("file '"+slides[i].name+"'\nduration "+str(round(durations[i],3))+"\n" for i in range(len(slides)))+"file '"+slides[-1].name+"'\n")
         video=wd/'wideobook.mp4'
-        ff(['-f','concat','-safe','0','-i',slide_list,'-i',audio,'-map','0:v:0','-map','1:a:0','-vsync','vfr','-vf','pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black','-c:v','libx264','-preset','ultrafast','-crf','29','-pix_fmt','yuv420p','-c:a','aac','-b:a','96k','-movflags','+faststart','-shortest',video])
+        ff(['-f','concat','-safe','0','-i',slide_list,'-i',audio,'-map','0:v:0','-map','1:a:0','-vsync','vfr','-vf',"scale=w='min(1440,iw)':h=-2:flags=lanczos,pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black",'-c:v','libx264','-threads','1','-x264-params','threads=1:lookahead-threads=1','-preset','ultrafast','-crf','29','-pix_fmt','yuv420p','-c:a','aac','-b:a','96k','-movflags','+faststart','-shortest',video])
         state(job,'Gotowy wideobook MP4 i MP3',100)
         job['ready']=True
     except Exception as e:
         job['error']=str(e);state(job,'Błąd: '+str(e),job.get('progress',0))
-    finally: busy.release()
+    finally:
+        gc.collect()
+        busy.release()
 
 @app.get('/api/narrators')
 def narrators(req:Request):
@@ -374,7 +377,7 @@ let coverRes=await fetch('/api/opening-page',{method:'POST',body:coverBlob,heade
 let coverInfo=await coverRes.json();if(!coverRes.ok)throw Error(coverInfo.detail||'Błąd strony tytułowej');
 s.textContent='Przesyłanie całego PDF...';
 let res=await fetch('/api/upload?opening_id='+encodeURIComponent(coverInfo.opening_id)+'&intro='+encodeURIComponent(document.getElementById('intro').value)+'&voice='+encodeURIComponent(selectedVoice==='custom'?'pl-PL-MarekNeural':selectedVoice)+'&narrator='+encodeURIComponent(selectedVoice==='custom'?uploadedNarrator:''),{method:'POST',body:f,headers:{'Content-Type':'application/pdf'}});let data=await res.json();if(!res.ok)throw Error(data.detail||'Błąd przesyłania');let id=data.id;
-let timer=setInterval(async()=>{try{let x=await (await fetch('/api/status/'+id)).json();document.getElementById('bar').value=x.progress||0;s.textContent=x.stage||'Przetwarzanie';if(x.ready||x.error){clearInterval(timer);btn.disabled=false;if(x.ready)document.getElementById('links').innerHTML='<a href="/api/download/'+id+'/mp4">POBIERZ WIDEOBOOK MP4</a><a href="/api/download/'+id+'/mp3">POBIERZ NARRACJĘ MP3</a>'}}catch(e){s.textContent='Nie można odczytać postępu: '+e.message}},2500)
+let timer=setInterval(async()=>{try{let response=await fetch('/api/status/'+id);if(response.status===404){clearInterval(timer);btn.disabled=false;s.textContent='Serwer uruchomił się ponownie i przerwał to zadanie. Uruchom generowanie jeszcze raz.';return}if(response.status===401){clearInterval(timer);btn.disabled=false;s.textContent='Sesja wygasła. Zaloguj się ponownie, aby sprawdzić postęp.';return}if(!response.ok)throw Error('HTTP '+response.status);let x=await response.json();document.getElementById('bar').value=x.progress||0;s.textContent=x.stage||'Przetwarzanie';if(x.ready||x.error){clearInterval(timer);btn.disabled=false;if(x.ready)document.getElementById('links').innerHTML='<a href="/api/download/'+id+'/mp4">POBIERZ WIDEOBOOK MP4</a><a href="/api/download/'+id+'/mp3">POBIERZ NARRACJĘ MP3</a>'}}catch(e){s.textContent='Nie można odczytać postępu: '+e.message}},2500)
 }catch(e){s.textContent='Błąd: '+e.message;btn.disabled=false}}
 </script></body></html>'''
 LOGIN='''<!doctype html><html lang="pl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="background:#09222b;color:#f7db88;font:18px system-ui;max-width:480px;margin:13vh auto;padding:24px"><h1>CHMURA NARRATORA ZUE</h1><p>PRYWATNE STUDIO — WEJŚCIE WYŁĄCZNIE NA HASŁO WŁAŚCICIELA</p><form method="post" action="/login"><label for="password">Hasło właściciela</label><input id="password" type="password" name="password" autocomplete="current-password" required style="box-sizing:border-box;width:100%;padding:14px;font-size:20px"><button type="submit" style="width:100%;padding:14px;margin-top:15px;background:#f4cc76">OTWÓRZ STUDIO NA HASŁO</button></form></body></html>'''
