@@ -65,8 +65,8 @@ async def speak(txt,out,voice=VOICE):
     if voice not in VOICES: raise ValueError('Nieznany głos')
     await edge_tts.Communicate(txt,voice,rate='-4%').save(str(out))
     if not out.exists() or out.stat().st_size<1000:raise RuntimeError('Nie udało się uzyskać narracji')
-def make_book_spreads(slides,durations,wd):
-    # Page 1 is a cover on the right. The following pages appear in facing pairs.
+def make_book_spreads(slides,durations,wd,opening_page=None):
+    # First spread: optional title page on the left and original PDF cover on the right.
     with Image.open(slides[0]) as sample:
         page_w,page_h=sample.size
     pad=max(18,round(page_w*0.055))
@@ -85,6 +85,10 @@ def make_book_spreads(slides,durations,wd):
         draw=ImageDraw.Draw(frame)
         for x,y in (left,right):
             draw.rectangle((x-2,y-2,x+page_w+1,y+page_h+1),fill=(246,241,229),outline=(201,161,71),width=3)
+        if sequence==0 and opening_page:
+            with Image.open(opening_page) as source:
+                cover=ImageOps.contain(source.convert('RGB'),(page_w,page_h),Image.Resampling.LANCZOS)
+                frame.paste(cover,(left[0]+(page_w-cover.width)//2,left[1]+(page_h-cover.height)//2))
         for index,number in enumerate(page_numbers):
             x,y=(right if number==0 else (left if index==0 else right))
             with Image.open(slides[number]) as source:
@@ -98,7 +102,7 @@ def make_book_spreads(slides,durations,wd):
         frame_durations.append(length)
     return frames,frame_durations
 
-def render(job,path,intro,voice=VOICE,custom_recording=None):
+def render(job,path,intro,voice=VOICE,custom_recording=None,opening_page=None):
     if not busy.acquire(blocking=False):
         state(job,'Inny wideobook jest właśnie tworzony — spróbuj ponownie później',0);job['error']='Zajęte studio';return
     try:
@@ -161,7 +165,7 @@ def render(job,path,intro,voice=VOICE,custom_recording=None):
         audio=wd/'narracja.mp3'
         ff(['-f','concat','-safe','0','-i',audio_list,'-c','copy',audio])
         state(job,'Składanie stron w otwartą książkę',79)
-        slides,durations=make_book_spreads(slides,durations,wd)
+        slides,durations=make_book_spreads(slides,durations,wd,opening_page)
         slide_list=wd/'images.txt'
         slide_list.write_text(''.join("file '"+slides[i].name+"'\nduration "+str(round(durations[i],3))+"\n" for i in range(len(slides)))+"file '"+slides[-1].name+"'\n")
         video=wd/'wideobook.mp4'
@@ -212,6 +216,37 @@ async def add_narrator(req:Request):
         dest.unlink(missing_ok=True)
         raise
 
+@app.post('/api/opening-page')
+async def upload_opening_page(req:Request):
+    auth(req)
+    if req.headers.get('content-type','').split(';',1)[0] not in ('image/png','image/jpeg'):
+        raise HTTPException(400,'Strona tytułowa musi być obrazem JPG lub PNG')
+    token=uuid.uuid4().hex
+    directory=ROOT/'opening-pages';directory.mkdir(exist_ok=True)
+    dest=directory/(token+'.jpg')
+    size=0
+    try:
+        with dest.open('wb') as out:
+            async for chunk in req.stream():
+                size+=len(chunk)
+                if size>12*1024*1024:
+                    raise HTTPException(413,'Strona tytułowa jest zbyt duża (maks. 12 MB)')
+                out.write(chunk)
+        with Image.open(dest) as source:
+            if source.width<300 or source.height<400 or source.width*source.height>24_000_000:
+                raise ValueError('Obraz musi mieć co najmniej 300x400 pikseli i najwyżej 24 megapiksele')
+            normalized=ImageOps.exif_transpose(source).convert('RGB')
+        normalized.thumbnail((1600,2400),Image.Resampling.LANCZOS)
+        normalized.save(dest,format='JPEG',quality=90,optimize=True)
+        normalized.close()
+        return {'opening_id':token}
+    except HTTPException:
+        dest.unlink(missing_ok=True)
+        raise
+    except Exception as e:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(400,'Nieprawidłowy obraz strony tytułowej: '+str(e))
+
 HTML=r'''<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CHMURA NARRATORA ZUE</title><style>
 :root{font-family:system-ui;background:#071b22;color:#e9e4cc}body{margin:0}header{text-align:center;padding:35px 12px;border-bottom:2px solid #ad873a;color:#f8cf6d}h1{font-size:clamp(24px,5vw,44px);margin:0 0 8px}main{max-width:740px;margin:30px auto;padding:0 20px}.panel{border:1px solid #b99954;border-radius:15px;background:#112a31;padding:25px;box-shadow:0 5px 30px #0005}label{display:block;margin:15px 0 7px;font-weight:600}input,textarea,select{box-sizing:border-box;width:100%;font:inherit;background:#f9f5e9;color:#162527;padding:13px;border-radius:8px;border:0}textarea{min-height:95px}button{font:inherit;margin:18px 0 8px;background:linear-gradient(90deg,#f9df88,#bc8a34);color:#14252a;font-weight:800;border:0;border-radius:9px;padding:14px 20px;cursor:pointer;width:100%}p{line-height:1.5}.muted{color:#c3c8c4}.status{min-height:60px;background:#0b2028;border-radius:9px;padding:15px;margin-top:12px}.links a{display:block;margin:14px 0;color:#ffdc82;font-weight:700}progress{width:100%;height:24px}.secondary{background:#294953;color:#ffdd8b;border:1px solid #ac873a}audio{width:100%}select{margin:8px 0}
 
@@ -219,6 +254,9 @@ footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h
 
 <h2>Dodaj całą książkę PDF</h2><p class="muted">Tworzenie wideobooka tylko po ręcznym naciśnięciu przycisku. Dostęp do studia zabezpieczony hasłem.</p>
 <label>Książka PDF</label><input id="file" type="file" accept=".pdf,application/pdf">
+<label>PIERWSZA STRONA PO LEWEJ — złota strona tytułowa</label><input id="opening-file" type="file" accept="image/png,image/jpeg" onchange="setOpeningPage()">
+<p class="muted" id="opening-status">Wybierz przesłaną złotą stronę tytułową. Program zachowa ją w tej przeglądarce i doda po lewej stronie pierwszej rozkładówki.</p>
+<img id="opening-preview" alt="Podgląd lewej strony tytułowej" style="display:none;max-height:220px;max-width:100%;border:2px solid #c7a04b;margin-top:8px;border-radius:4px">
 <p class="muted"><b>FORMAT KSIĄŻKOWY:</b> otwarta książka z dwiema stronami obok siebie. Okładka pokazuje się jako pierwsza. Narracja czyta strony po kolei, ilustracje i oryginalny PDF pozostają bez zmian.</p>
 <label>Krótki wstęp czytany przez narratora</label><textarea id="intro">Niekończąca się Księga. Oto kolejny tom podróży Zuemy i kosmicznej rasy Zue. Zapraszamy do wysłuchania opowieści.</textarea>
 <label>WYBIERZ LEKTORA DO WIDEOBOOKA</label>
@@ -255,6 +293,36 @@ footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h
 </div></main><footer>Andrzej Muller · Zuema · Studio wideobooków — bez sklepu i płatności</footer><script>
 
 let uploadedNarrator='';
+const openingStorageKey='chmura-zue-opening-left-v1';
+let openingPageData='';
+try{openingPageData=localStorage.getItem(openingStorageKey)||''}catch(e){}
+function showOpeningPage(){
+ const preview=document.getElementById('opening-preview');
+ const status=document.getElementById('opening-status');
+ if(openingPageData.startsWith('data:image/jpeg;base64,')){
+  preview.src=openingPageData;preview.style.display='block';
+  status.textContent='Złota strona tytułowa gotowa. Będzie po lewej na samym początku każdego nowego wideobooka (w tej przeglądarce).';
+ }else{preview.style.display='none';status.textContent='Wybierz złotą stronę tytułową JPG lub PNG — bez niej nie rozpocznie się nowy wideobook.'}
+}
+async function setOpeningPage(){
+ const file=document.getElementById('opening-file').files[0];
+ if(!file)return;
+ const status=document.getElementById('opening-status');
+ if(!['image/jpeg','image/png'].includes(file.type)){status.textContent='Wybierz obraz JPG lub PNG.';return}
+ if(file.size>12*1024*1024){status.textContent='Obraz przekracza limit 12 MB.';return}
+ try{
+  const img=await createImageBitmap(file);
+  const ratio=Math.min(1,1300/img.width,2000/img.height);
+  const canvas=document.createElement('canvas');
+  canvas.width=Math.round(img.width*ratio);canvas.height=Math.round(img.height*ratio);
+  canvas.getContext('2d').drawImage(img,0,0,canvas.width,canvas.height);
+  img.close();
+  openingPageData=canvas.toDataURL('image/jpeg',0.9);
+  try{localStorage.setItem(openingStorageKey,openingPageData);showOpeningPage()}
+  catch(e){showOpeningPage();status.textContent='Strona tytułowa gotowa na tę sesję. Przeglądarka nie zapisała jej na później.'}
+ }catch(e){status.textContent='Nie udało się przygotować strony tytułowej: '+e.message}
+}
+showOpeningPage();
 const storageKey='chmura-zue-narrators-v1';
 let savedNarrators=[];
 try{savedNarrators=JSON.parse(localStorage.getItem(storageKey)||'[]');if(!Array.isArray(savedNarrators))savedNarrators=[]}catch(e){savedNarrators=[]}
@@ -297,11 +365,15 @@ initNarrators();
 async function addNarrator(){let f=document.getElementById('narrator-file').files[0],label=document.getElementById('narrator-result');uploadedNarrator='';if(!f){label.textContent='Wybierz plik nagrania lektora';return}if(f.size>250*1024*1024){label.textContent='Nagranie przekracza 250 MB';return}
 let ext=f.name.split('.').pop().toLowerCase();label.textContent='Wgrywanie nagrania lektora...';
 try{let r=await fetch('/api/add-narrator?ext='+encodeURIComponent(ext),{method:'POST',body:f,headers:{'Content-Type':'application/octet-stream'}});let d=await r.json();if(!r.ok)throw Error(d.detail||'Błąd nagrania');uploadedNarrator=d.narrator_id;label.textContent='LEKTOR DODANY — nagranie: '+Math.round(d.duration_seconds/60)+' min. Możesz tworzyć wideobook.'}catch(e){label.textContent=e.message}}
-async function upload(){let f=document.getElementById('file').files[0];if(!f){alert('Najpierw wybierz PDF');return}if(f.size>400*1024*1024){alert('Limit pliku PDF: 400 MB');return}
+async function upload(){let f=document.getElementById('file').files[0];if(!f){alert('Najpierw wybierz PDF');return}if(f.size>400*1024*1024){alert('Limit pliku PDF: 400 MB');return}if(!openingPageData){alert('Najpierw wybierz złotą stronę tytułową po lewej');return}
 let selectedVoice=getMode();
 if(selectedVoice==='custom'&&!uploadedNarrator){alert('Najpierw kliknij DODAJ LEKTORA i wgraj całe nagranie książki');return}
-let btn=document.getElementById('create');btn.disabled=true;let s=document.getElementById('status');s.textContent='Przesyłanie całego PDF...';try{
-let res=await fetch('/api/upload?intro='+encodeURIComponent(document.getElementById('intro').value)+'&voice='+encodeURIComponent(selectedVoice==='custom'?'pl-PL-MarekNeural':selectedVoice)+'&narrator='+encodeURIComponent(selectedVoice==='custom'?uploadedNarrator:''),{method:'POST',body:f,headers:{'Content-Type':'application/pdf'}});let data=await res.json();if(!res.ok)throw Error(data.detail||'Błąd przesyłania');let id=data.id;
+let btn=document.getElementById('create');btn.disabled=true;let s=document.getElementById('status');s.textContent='Dodawanie złotej strony tytułowej po lewej...';try{
+let coverBlob=await (await fetch(openingPageData)).blob();
+let coverRes=await fetch('/api/opening-page',{method:'POST',body:coverBlob,headers:{'Content-Type':'image/jpeg'}});
+let coverInfo=await coverRes.json();if(!coverRes.ok)throw Error(coverInfo.detail||'Błąd strony tytułowej');
+s.textContent='Przesyłanie całego PDF...';
+let res=await fetch('/api/upload?opening_id='+encodeURIComponent(coverInfo.opening_id)+'&intro='+encodeURIComponent(document.getElementById('intro').value)+'&voice='+encodeURIComponent(selectedVoice==='custom'?'pl-PL-MarekNeural':selectedVoice)+'&narrator='+encodeURIComponent(selectedVoice==='custom'?uploadedNarrator:''),{method:'POST',body:f,headers:{'Content-Type':'application/pdf'}});let data=await res.json();if(!res.ok)throw Error(data.detail||'Błąd przesyłania');let id=data.id;
 let timer=setInterval(async()=>{try{let x=await (await fetch('/api/status/'+id)).json();document.getElementById('bar').value=x.progress||0;s.textContent=x.stage||'Przetwarzanie';if(x.ready||x.error){clearInterval(timer);btn.disabled=false;if(x.ready)document.getElementById('links').innerHTML='<a href="/api/download/'+id+'/mp4">POBIERZ WIDEOBOOK MP4</a><a href="/api/download/'+id+'/mp3">POBIERZ NARRACJĘ MP3</a>'}}catch(e){s.textContent='Nie można odczytać postępu: '+e.message}},2500)
 }catch(e){s.textContent='Błąd: '+e.message;btn.disabled=false}}
 </script></body></html>'''
@@ -332,7 +404,7 @@ def logout():
 
 
 @app.post('/api/upload')
-async def upload(req:Request,intro:str='',voice:str=VOICE,narrator:str=''):
+async def upload(req:Request,intro:str='',voice:str=VOICE,narrator:str='',opening_id:str=''):
     auth(req)
     if voice not in VOICES:raise HTTPException(400,'Nieznany głos narratora')
     custom_path=None
@@ -340,6 +412,11 @@ async def upload(req:Request,intro:str='',voice:str=VOICE,narrator:str=''):
         if not re.fullmatch('[a-f0-9]{32}',narrator):raise HTTPException(400,'Niepoprawny identyfikator lektora')
         custom_path=ROOT/'narrators'/(narrator+'.audio')
         if not custom_path.is_file():raise HTTPException(400,'Brak pliku lektora')
+    opening_path=None
+    if opening_id:
+        if not re.fullmatch('[a-f0-9]{32}',opening_id):raise HTTPException(400,'Niepoprawny identyfikator strony tytułowej')
+        opening_path=ROOT/'opening-pages'/(opening_id+'.jpg')
+        if not opening_path.is_file():raise HTTPException(400,'Brak przesłanej strony tytułowej')
     if req.headers.get('content-type')!='application/pdf':raise HTTPException(400,'Dodaj plik PDF')
     name=uuid.uuid4().hex
     project=ROOT/name;project.mkdir()
@@ -359,7 +436,7 @@ async def upload(req:Request,intro:str='',voice:str=VOICE,narrator:str=''):
         path.unlink(missing_ok=True);raise HTTPException(400,'Niepoprawny PDF: '+str(e))
     job={'id':name,'stage':'Przygotowanie książki','progress':0,'pages':count,'ready':False}
     jobs[name]=job
-    threading.Thread(target=render,args=(job,path,intro[:700],voice,custom_path),daemon=True).start()
+    threading.Thread(target=render,args=(job,path,intro[:700],voice,custom_path,opening_path),daemon=True).start()
     return {'id':name,'pages':count}
 @app.get('/api/status/{job_id}')
 def status(req:Request,job_id:str):
