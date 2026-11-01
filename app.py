@@ -256,11 +256,7 @@ HTML=r'''<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><meta name="
 
 footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h1>CHMURA NARRATORA ZUE</h1><div>PRYWATNE STUDIO · DOSTĘP NA HASŁO</div><form action="/logout" method="post" style="max-width:250px;margin:10px auto 0"><button class="secondary" type="submit" style="margin:8px 0">WYLOGUJ · ZABLOKUJ STUDIO</button></form></header><main><div class="panel">
 
-<section aria-labelledby="drive-title" style="border-bottom:1px solid #b99954;padding-bottom:20px;margin-bottom:25px">
-<h2 id="drive-title">Mój Dysk Google</h2>
-<a class="secondary" href="https://drive.google.com/drive/my-drive" target="_blank" rel="noopener noreferrer" style="display:block;text-align:center;padding:15px;border-radius:9px;text-decoration:none;font-weight:800">OTWÓRZ MÓJ DYSK GOOGLE ↗</a>
-<p class="muted">Gotowe pliki MP4 i MP3 pobierz przyciskami poniżej. Następnie możesz przesłać je ręcznie na swój Dysk Google.</p>
-</section>
+
 <h2>Dodaj całą książkę PDF</h2><p class="muted">Tworzenie wideobooka tylko po ręcznym naciśnięciu przycisku. Dostęp do studia zabezpieczony hasłem.</p>
 <label>Książka PDF — maksymalnie 1000 stron</label><input id="file" type="file" accept=".pdf,application/pdf">
 <label>PIERWSZA STRONA PO LEWEJ — złota strona tytułowa</label><input id="opening-file" type="file" accept="image/png,image/jpeg" onchange="setOpeningPage()">
