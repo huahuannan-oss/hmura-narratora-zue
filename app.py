@@ -18,6 +18,7 @@ jobs={}
 lock=threading.Lock()
 busy=threading.Semaphore(1)
 MAX_SIZE=400*1024*1024
+MAX_PAGES=200
 VOICE='pl-PL-MarekNeural'
 VOICES={'pl-PL-MarekNeural':'Marek — głos polski','pl-PL-ZofiaNeural':'Zofia — głos polski'}
 
@@ -109,7 +110,7 @@ def render(job,path,intro,voice=VOICE,custom_recording=None,opening_page=None):
         wd=ROOT/job['id'];wd.mkdir(exist_ok=True)
         pdf=fitz.open(path)
         total=len(pdf);job['pages']=total
-        if total>400: raise RuntimeError('Limit 400 stron na jeden projekt')
+        if total>MAX_PAGES: raise RuntimeError(f'Limit {MAX_PAGES} stron na jeden projekt')
         audios=[];slides=[];durations=[];texts=[]
         first_chapter=next((i for i in range(min(total,20)) if re.search(r'ROZDZIAŁ\s+I\b',pdf[i].get_text(),re.I)),min(total-1,5))
         # For the known book, PDF page 2 = short introduction, pages 3-4 = silent table of contents.
@@ -256,7 +257,7 @@ HTML=r'''<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><meta name="
 footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h1>CHMURA NARRATORA ZUE</h1><div>PRYWATNE STUDIO · DOSTĘP NA HASŁO</div><form action="/logout" method="post" style="max-width:250px;margin:10px auto 0"><button class="secondary" type="submit" style="margin:8px 0">WYLOGUJ · ZABLOKUJ STUDIO</button></form></header><main><div class="panel">
 
 <h2>Dodaj całą książkę PDF</h2><p class="muted">Tworzenie wideobooka tylko po ręcznym naciśnięciu przycisku. Dostęp do studia zabezpieczony hasłem.</p>
-<label>Książka PDF</label><input id="file" type="file" accept=".pdf,application/pdf">
+<label>Książka PDF — maksymalnie 200 stron</label><input id="file" type="file" accept=".pdf,application/pdf">
 <label>PIERWSZA STRONA PO LEWEJ — złota strona tytułowa</label><input id="opening-file" type="file" accept="image/png,image/jpeg" onchange="setOpeningPage()">
 <p class="muted" id="opening-status">Wybierz przesłaną złotą stronę tytułową. Program zachowa ją w tej przeglądarce i doda po lewej stronie pierwszej rozkładówki.</p>
 <img id="opening-preview" alt="Podgląd lewej strony tytułowej" style="display:none;max-height:220px;max-width:100%;border:2px solid #c7a04b;margin-top:8px;border-radius:4px">
@@ -437,6 +438,9 @@ async def upload(req:Request,intro:str='',voice:str=VOICE,narrator:str='',openin
         if not count:raise ValueError('Pusty PDF')
     except Exception as e:
         path.unlink(missing_ok=True);raise HTTPException(400,'Niepoprawny PDF: '+str(e))
+    if count>MAX_PAGES:
+        path.unlink(missing_ok=True)
+        raise HTTPException(400,f'Limit {MAX_PAGES} stron na jeden projekt. Ten PDF ma {count} stron.')
     job={'id':name,'stage':'Przygotowanie książki','progress':0,'pages':count,'ready':False}
     jobs[name]=job
     threading.Thread(target=render,args=(job,path,intro[:700],voice,custom_path,opening_path),daemon=True).start()
