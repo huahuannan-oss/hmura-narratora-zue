@@ -8,6 +8,9 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 import uvicorn
 import edge_tts
+from urllib.request import Request as URLRequest, urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlparse
 
 ROOT=Path('/app/data');ROOT.mkdir(parents=True,exist_ok=True)
 PASSWORD=os.environ.get('CHMURA_PASSWORD','')
@@ -19,6 +22,7 @@ lock=threading.Lock()
 busy=threading.Semaphore(1)
 MAX_SIZE=400*1024*1024
 MAX_PAGES=1000
+GOOGLE_CLIENT_ID=os.environ.get('GOOGLE_CLIENT_ID','')
 VOICE='pl-PL-MarekNeural'
 VOICES={'pl-PL-MarekNeural':'Marek — głos polski','pl-PL-ZofiaNeural':'Zofia — głos polski'}
 
@@ -180,6 +184,104 @@ def render(job,path,intro,voice=VOICE,custom_recording=None,opening_page=None):
         gc.collect()
         busy.release()
 
+def drive_request(token,url,method='GET',data=None,headers=None):
+    # Fixed Google endpoints only; never log the short-lived access token.
+    parsed=urlparse(url)
+    if parsed.scheme!='https' or parsed.hostname!='www.googleapis.com':
+        raise ValueError('Nieprawidłowy adres Dysku Google')
+    req=URLRequest(url,data=data,method=method,headers={
+        'Authorization':'Bearer '+token,**(headers or {})})
+    try:
+        with urlopen(req,timeout=90) as response:
+            return response.status,response.headers,response.read()
+    except HTTPError as exc:
+        if exc.code==308:return 308,exc.headers,b''
+        if exc.code==401:raise RuntimeError('Połączenie z Google wygasło. Kliknij POŁĄCZ Z GOOGLE i ponów zapis.') from None
+        if exc.code==403:raise RuntimeError('Google odmówił zapisu. Sprawdź zgodę na dostęp, wolne miejsce i włączenie Google Drive API.') from None
+        raise RuntimeError('Dysk Google zwrócił błąd HTTP '+str(exc.code)+'. Ponów zapis.') from None
+    except (URLError,TimeoutError):
+        raise RuntimeError('Przerwano połączenie z Dyskiem Google. Ponów zapis.') from None
+
+def drive_json(token,path,method='GET',body=None):
+    _,_,data=drive_request(token,'https://www.googleapis.com/drive/v3/'+path,method,
+        json.dumps(body).encode() if body is not None else None,{'Content-Type':'application/json'})
+    return json.loads(data)
+
+def drive_find(token,query):
+    result=drive_json(token,'files?'+urlencode({'q':query+' and trashed = false','fields':'files(id)','pageSize':1}))
+    return next(iter(result.get('files',[])),{}).get('id')
+
+def save_to_drive(job,token):
+    try:
+        folder=drive_find(token,"mimeType = 'application/vnd.google-apps.folder' and appProperties has { key='zueStudio' and value='v1' }")
+        if not folder:
+            folder=drive_json(token,'files',method='POST',body={
+                'name':'Chmura Narratora ZUE','mimeType':'application/vnd.google-apps.folder',
+                'appProperties':{'zueStudio':'v1'}})['id']
+        job['drive_folder']='https://drive.google.com/drive/folders/'+folder
+        for filename,mime in [('book.pdf','application/pdf'),('wideobook.mp4','video/mp4'),('narracja.mp3','audio/mpeg')]:
+            marker=job['id']+'-'+filename
+            existing=drive_find(token,"appProperties has { key='zueArtifact' and value='"+marker+"' }")
+            if existing:continue
+            path=ROOT/job['id']/filename
+            size=path.stat().st_size
+            job['drive_stage']='Zapisywanie '+filename+' na Dysku Google'
+            metadata={'name':'ZUE_'+job['id']+'_'+filename,'parents':[folder],
+                'appProperties':{'zueArtifact':marker}}
+            _,headers,_=drive_request(token,'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable','POST',
+                json.dumps(metadata).encode(),{'Content-Type':'application/json','X-Upload-Content-Type':mime,'X-Upload-Content-Length':str(size)})
+            location=headers.get('Location','')
+            offset=0
+            with path.open('rb') as source:
+                while offset<size:
+                    source.seek(offset)
+                    chunk=source.read(8*1024*1024)
+                    code,reply,_=drive_request(token,location,'PUT',chunk,{
+                        'Content-Type':mime,'Content-Range':f'bytes {offset}-{offset+len(chunk)-1}/{size}'})
+                    if code in (200,201):offset=size
+                    elif code==308:
+                        reported=reply.get('Range','')
+                        match=re.fullmatch(r'bytes=0-(\d+)',reported)
+                        accepted=int(match.group(1))+1 if match else 0
+                        if accepted<=offset or accepted>offset+len(chunk):raise RuntimeError('Google nie potwierdził fragmentu pliku. Ponów zapis.')
+                        offset=accepted
+                    else:raise RuntimeError('Google nie potwierdził zapisu pliku. Ponów zapis.')
+                    job['drive_stage']='Zapisywanie '+filename+': '+str(round(100*offset/size))+'%'
+        job['drive_stage']='Zapisano PDF, wideobook MP4 i narrację MP3 na Dysku Google.'
+        job['drive_saved']=True
+    except Exception as exc:
+        # Report only our own controlled messages, never request headers or tokens.
+        job['drive_error']=str(exc) if isinstance(exc,RuntimeError) else 'Nie udało się zapisać na Dysku Google. Ponów zapis.'
+        job['drive_stage']=job['drive_error']
+    finally:
+        job['drive_busy']=False
+
+@app.get('/api/drive/config')
+def drive_config(req:Request):
+    auth(req)
+    return {'client_id':GOOGLE_CLIENT_ID}
+
+@app.post('/api/drive/save/{job_id}')
+async def drive_save(req:Request,job_id:str):
+    auth(req)
+    if req.headers.get('origin') not in (None,str(req.base_url).rstrip('/')):
+        raise HTTPException(403,'Nieprawidłowe źródło żądania')
+    if int(req.headers.get('content-length','0'))>8192:raise HTTPException(413,'Żądanie jest zbyt duże')
+    body=await req.body()
+    if len(body)>8192:raise HTTPException(413,'Żądanie jest zbyt duże')
+    try:token=json.loads(body).get('access_token','')
+    except (ValueError,AttributeError):raise HTTPException(400,'Nieprawidłowe żądanie')
+    if not isinstance(token,str) or not re.fullmatch(r'[A-Za-z0-9._~-]{20,4096}',token):
+        raise HTTPException(400,'Najpierw połącz się z Google')
+    with lock:
+        job=jobs.get(job_id)
+        if not job or not job.get('ready'):raise HTTPException(404,'Wideobook nie jest gotowy')
+        if job.get('drive_saved') or job.get('drive_busy'):return {'started':False}
+        job.update(drive_busy=True,drive_stage='Łączenie z Dyskiem Google')
+        job.pop('drive_error',None)
+    threading.Thread(target=save_to_drive,args=(job,token),daemon=True).start()
+    return {'started':True}
+
 @app.get('/api/narrators')
 def narrators(req:Request):
     auth(req)
@@ -256,6 +358,20 @@ HTML=r'''<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><meta name="
 
 footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h1>CHMURA NARRATORA ZUE</h1><div>PRYWATNE STUDIO · DOSTĘP NA HASŁO</div><form action="/logout" method="post" style="max-width:250px;margin:10px auto 0"><button class="secondary" type="submit" style="margin:8px 0">WYLOGUJ · ZABLOKUJ STUDIO</button></form></header><main><div class="panel">
 
+<section aria-labelledby="drive-title" style="border-bottom:1px solid #b99954;padding-bottom:20px;margin-bottom:25px">
+<h2 id="drive-title">Mój Dysk Google</h2>
+<a class="secondary" href="https://drive.google.com/drive/my-drive" target="_blank" rel="noopener noreferrer" style="display:block;text-align:center;padding:15px;border-radius:9px;text-decoration:none;font-weight:800">OTWÓRZ MÓJ DYSK GOOGLE ↗</a>
+<button class="secondary" type="button" onclick="connectDrive()">POŁĄCZ Z GOOGLE · WŁĄCZ ZAPIS</button>
+<label style="font-weight:400"><input id="drive-auto" type="checkbox" checked style="width:auto"> Zapisuj gotowy PDF, MP4 i MP3 po utworzeniu wideobooka</label>
+<p class="muted">Po połączeniu pliki trafią do folderu „Chmura Narratora ZUE” na wybranym koncie Google. Pozostaw tę kartę otwartą do rozpoczęcia zapisu. Gdy zgoda Google wygaśnie, połącz się ponownie i naciśnij ZAPISZ.</p>
+<p id="drive-status" role="status">Dysk nie jest jeszcze połączony. Przycisk OTWÓRZ MÓJ DYSK GOOGLE działa od razu.</p>
+<button id="drive-save" class="secondary" type="button" onclick="saveDrive()" hidden>ZAPISZ GOTOWE PLIKI NA DYSKU GOOGLE</button>
+<a id="drive-folder" target="_blank" rel="noopener noreferrer" style="color:#ffdc82" hidden>OTWÓRZ FOLDER Z ZAPISANYMI PLIKAMI ↗</a>
+<details id="drive-setup"><summary style="cursor:pointer">Pierwsze połączenie — ustawienia Google</summary>
+<p>Aby uruchomić zapis, potrzebny jest identyfikator aplikacji Google OAuth. Nie jest to hasło ani płatna usługa. Sam link do folderu nie daje aplikacji prawa zapisu.</p>
+<label for="drive-client-id">Identyfikator klienta Google OAuth</label><input id="drive-client-id" type="text" placeholder="…apps.googleusercontent.com" autocomplete="off">
+<p class="muted">Jednorazowo w <a href="https://console.cloud.google.com/" target="_blank" rel="noopener noreferrer" style="color:#ffdc82">Google Cloud</a>: włącz Google Drive API, skonfiguruj ekran zgody i dodaj swoje konto jako użytkownika testowego. Utwórz klienta OAuth typu „Aplikacja internetowa”, a jako autoryzowane źródło JavaScript wpisz <b>https://chmura-narratora-zue.onrender.com</b>. Wklej identyfikator powyżej i kliknij POŁĄCZ Z GOOGLE. Nie włączaj rozliczeń. Aplikacja prosi tylko o dostęp do plików, które sama tworzy.</p>
+</details></section>
 <h2>Dodaj całą książkę PDF</h2><p class="muted">Tworzenie wideobooka tylko po ręcznym naciśnięciu przycisku. Dostęp do studia zabezpieczony hasłem.</p>
 <label>Książka PDF — maksymalnie 1000 stron</label><input id="file" type="file" accept=".pdf,application/pdf">
 <label>PIERWSZA STRONA PO LEWEJ — złota strona tytułowa</label><input id="opening-file" type="file" accept="image/png,image/jpeg" onchange="setOpeningPage()">
@@ -296,6 +412,67 @@ footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h
 <p class="muted">Na darmowym serwerze generowanie bardzo długich książek może się nie udać z powodu ograniczonej pamięci i czasu. Gotowe pliki pobierz od razu: pamięć serwera nie jest trwała.</p>
 </div></main><footer>Andrzej Muller · Zuema · Studio wideobooków — bez sklepu i płatności</footer><script>
 
+let driveToken='',driveExpires=0,driveJob='',drivePoll=null;
+const driveScope='https://www.googleapis.com/auth/drive.file';
+const driveLabel=()=>document.getElementById('drive-status');
+try{document.getElementById('drive-client-id').value=localStorage.getItem('zue-google-client-id')||''}catch(e){}
+fetch('/api/drive/config').then(r=>r.ok?r.json():{}).then(x=>{if(x.client_id)document.getElementById('drive-client-id').value=x.client_id}).catch(()=>{});
+let googleScript;
+function loadGoogle(){
+ if(window.google?.accounts?.oauth2)return Promise.resolve();
+ if(!googleScript)googleScript=new Promise((resolve,reject)=>{
+  const s=document.createElement('script');s.src='https://accounts.google.com/gsi/client';s.async=true;
+  s.onload=resolve;s.onerror=()=>{googleScript=null;reject(Error('Nie udało się załadować połączenia Google. Spróbuj ponownie.'))};document.head.appendChild(s);
+ });return googleScript;
+}
+async function connectDrive(){
+ const id=document.getElementById('drive-client-id').value.trim();
+ if(!/^[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$/.test(id)){
+  document.getElementById('drive-setup').open=true;
+  driveLabel().textContent='Zapis wymaga jednorazowego skonfigurowania aplikacji Google. Wklej identyfikator klienta OAuth w ustawieniach poniżej.';return;
+ }
+ try{
+  await loadGoogle();
+  const client=google.accounts.oauth2.initTokenClient({client_id:id,scope:driveScope,
+   callback:response=>{
+    if(response.error||!google.accounts.oauth2.hasGrantedAllScopes(response,driveScope)){driveLabel().textContent='Nie udzielono zgody na zapis na Dysku Google.';return}
+    driveToken=response.access_token;driveExpires=Date.now()+Number(response.expires_in||3600)*1000-30000;
+    try{localStorage.setItem('zue-google-client-id',id)}catch(e){}
+    driveLabel().textContent='Połączono z wybranym kontem Google. Gotowe pliki można zapisać w folderze Chmura Narratora ZUE.';
+    document.getElementById('drive-setup').open=false;
+   },error_callback:()=>{driveLabel().textContent='Okno Google zostało zamknięte lub zablokowane. Kliknij POŁĄCZ Z GOOGLE ponownie.'}
+  });client.requestAccessToken({prompt:'select_account'});
+ }catch(e){driveLabel().textContent=e.message}
+}
+function driveReady(id){
+ driveJob=id;document.getElementById('drive-save').hidden=false;
+ if(document.getElementById('drive-auto').checked){
+  if(driveToken&&Date.now()<driveExpires)saveDrive();
+  else driveLabel().textContent='Wideobook jest gotowy. Połącz się z Google, a następnie kliknij ZAPISZ GOTOWE PLIKI.';
+ }
+}
+function showDriveState(x){
+ driveLabel().textContent=x.drive_stage||'Zapisywanie na Dysku Google…';
+ if(x.drive_folder&&/^https:\/\/drive\.google\.com\/drive\/folders\/[A-Za-z0-9_-]+$/.test(x.drive_folder)){
+  const a=document.getElementById('drive-folder');a.href=x.drive_folder;a.hidden=false;
+ }
+ if(!x.drive_busy){clearInterval(drivePoll);drivePoll=null;document.getElementById('drive-save').disabled=false}
+}
+async function saveDrive(){
+ if(!driveJob)return;
+ if(!driveToken||Date.now()>=driveExpires){driveLabel().textContent='Kliknij POŁĄCZ Z GOOGLE, a potem ZAPISZ GOTOWE PLIKI.';return}
+ const btn=document.getElementById('drive-save');btn.disabled=true;
+ try{
+  const r=await fetch('/api/drive/save/'+driveJob,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({access_token:driveToken})});
+  const x=await r.json();if(!r.ok)throw Error(x.detail||'Nie udało się rozpocząć zapisu');
+  driveLabel().textContent='Rozpoczęto zapis na Dysku Google…';
+  if(drivePoll)clearInterval(drivePoll);
+  drivePoll=setInterval(async()=>{
+   try{const r=await fetch('/api/status/'+driveJob);if(!r.ok)throw Error('Utracono dostęp do projektu. Zaloguj się ponownie lub sprawdź połączenie.');showDriveState(await r.json())}
+   catch(e){clearInterval(drivePoll);drivePoll=null;btn.disabled=false;driveLabel().textContent=e.message}
+  },2500);
+ }catch(e){btn.disabled=false;driveLabel().textContent=e.message}
+}
 let uploadedNarrator='';
 const openingStorageKey='chmura-zue-opening-left-v1';
 let openingPageData='';
@@ -378,13 +555,13 @@ let coverRes=await fetch('/api/opening-page',{method:'POST',body:coverBlob,heade
 let coverInfo=await coverRes.json();if(!coverRes.ok)throw Error(coverInfo.detail||'Błąd strony tytułowej');
 s.textContent='Przesyłanie całego PDF...';
 let res=await fetch('/api/upload?opening_id='+encodeURIComponent(coverInfo.opening_id)+'&intro='+encodeURIComponent(document.getElementById('intro').value)+'&voice='+encodeURIComponent(selectedVoice==='custom'?'pl-PL-MarekNeural':selectedVoice)+'&narrator='+encodeURIComponent(selectedVoice==='custom'?uploadedNarrator:''),{method:'POST',body:f,headers:{'Content-Type':'application/pdf'}});let data=await res.json();if(!res.ok)throw Error(data.detail||'Błąd przesyłania');let id=data.id;
-let timer=setInterval(async()=>{try{let response=await fetch('/api/status/'+id);if(response.status===404){clearInterval(timer);btn.disabled=false;s.textContent='Serwer uruchomił się ponownie i przerwał to zadanie. Uruchom generowanie jeszcze raz.';return}if(response.status===401){clearInterval(timer);btn.disabled=false;s.textContent='Sesja wygasła. Zaloguj się ponownie, aby sprawdzić postęp.';return}if(!response.ok)throw Error('HTTP '+response.status);let x=await response.json();document.getElementById('bar').value=x.progress||0;s.textContent=x.stage||'Przetwarzanie';if(x.ready||x.error){clearInterval(timer);btn.disabled=false;if(x.ready)document.getElementById('links').innerHTML='<a href="/api/download/'+id+'/mp4">POBIERZ WIDEOBOOK MP4</a><a href="/api/download/'+id+'/mp3">POBIERZ NARRACJĘ MP3</a>'}}catch(e){s.textContent='Nie można odczytać postępu: '+e.message}},2500)
+let timer=setInterval(async()=>{try{let response=await fetch('/api/status/'+id);if(response.status===404){clearInterval(timer);btn.disabled=false;s.textContent='Serwer uruchomił się ponownie i przerwał to zadanie. Uruchom generowanie jeszcze raz.';return}if(response.status===401){clearInterval(timer);btn.disabled=false;s.textContent='Sesja wygasła. Zaloguj się ponownie, aby sprawdzić postęp.';return}if(!response.ok)throw Error('HTTP '+response.status);let x=await response.json();document.getElementById('bar').value=x.progress||0;s.textContent=x.stage||'Przetwarzanie';if(x.ready||x.error){clearInterval(timer);btn.disabled=false;if(x.ready){document.getElementById('links').innerHTML='<a href="/api/download/'+id+'/mp4">POBIERZ WIDEOBOOK MP4</a><a href="/api/download/'+id+'/mp3">POBIERZ NARRACJĘ MP3</a>';driveReady(id)}}}catch(e){s.textContent='Nie można odczytać postępu: '+e.message}},2500)
 }catch(e){s.textContent='Błąd: '+e.message;btn.disabled=false}}
 </script></body></html>'''
 LOGIN='''<!doctype html><html lang="pl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="background:#09222b;color:#f7db88;font:18px system-ui;max-width:480px;margin:13vh auto;padding:24px"><h1>CHMURA NARRATORA ZUE</h1><p>PRYWATNE STUDIO — WEJŚCIE WYŁĄCZNIE NA HASŁO WŁAŚCICIELA</p><form method="post" action="/login"><label for="password">Hasło właściciela</label><input id="password" type="password" name="password" autocomplete="current-password" required style="box-sizing:border-box;width:100%;padding:14px;font-size:20px"><button type="submit" style="width:100%;padding:14px;margin-top:15px;background:#f4cc76">OTWÓRZ STUDIO NA HASŁO</button></form></body></html>'''
 
 @app.get('/healthz')
-def health():return {'ok':True}
+def health():return {'ok':True,'features':['google-drive-v1']}
 @app.get('/',response_class=HTMLResponse)
 def home(req:Request):
     if not authorized(req):return HTMLResponse(LOGIN,headers={'Cache-Control':'no-store'})
@@ -458,3 +635,4 @@ def download(req:Request,job_id:str,kind:str):
     p=ROOT/job_id/('narracja.mp3' if kind=='mp3' else 'wideobook.mp4')
     return FileResponse(p,filename='Chmura_Narratora_ZUE_'+job_id+'.'+kind,media_type='audio/mpeg' if kind=='mp3' else 'video/mp4')
 if __name__=='__main__':uvicorn.run(app,host='0.0.0.0',port=int(os.environ.get('PORT','10000')))
+
