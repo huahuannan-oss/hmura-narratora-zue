@@ -18,7 +18,7 @@ jobs={}
 lock=threading.Lock()
 busy=threading.Semaphore(1)
 MAX_SIZE=400*1024*1024
-MAX_PAGES=200
+MAX_PAGES=1000
 VOICE='pl-PL-MarekNeural'
 VOICES={'pl-PL-MarekNeural':'Marek — głos polski','pl-PL-ZofiaNeural':'Zofia — głos polski'}
 
@@ -257,7 +257,7 @@ HTML=r'''<!DOCTYPE html><html lang="pl"><head><meta charset="utf-8"><meta name="
 footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h1>CHMURA NARRATORA ZUE</h1><div>PRYWATNE STUDIO · DOSTĘP NA HASŁO</div><form action="/logout" method="post" style="max-width:250px;margin:10px auto 0"><button class="secondary" type="submit" style="margin:8px 0">WYLOGUJ · ZABLOKUJ STUDIO</button></form></header><main><div class="panel">
 
 <h2>Dodaj całą książkę PDF</h2><p class="muted">Tworzenie wideobooka tylko po ręcznym naciśnięciu przycisku. Dostęp do studia zabezpieczony hasłem.</p>
-<label>Książka PDF — maksymalnie 200 stron</label><input id="file" type="file" accept=".pdf,application/pdf">
+<label>Książka PDF — maksymalnie 1000 stron</label><input id="file" type="file" accept=".pdf,application/pdf">
 <label>PIERWSZA STRONA PO LEWEJ — złota strona tytułowa</label><input id="opening-file" type="file" accept="image/png,image/jpeg" onchange="setOpeningPage()">
 <p class="muted" id="opening-status">Wybierz przesłaną złotą stronę tytułową. Program zachowa ją w tej przeglądarce i doda po lewej stronie pierwszej rozkładówki.</p>
 <img id="opening-preview" alt="Podgląd lewej strony tytułowej" style="display:none;max-height:220px;max-width:100%;border:2px solid #c7a04b;margin-top:8px;border-radius:4px">
