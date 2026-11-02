@@ -1,10 +1,10 @@
-import os, io, re, json, time, uuid, asyncio, threading, subprocess, secrets, hmac, gc
+import os, io, re, json, time, uuid, asyncio, threading, subprocess, secrets, hmac, gc, logging
 from pathlib import Path
 from http.cookies import SimpleCookie
 import fitz
 from mutagen.mp3 import MP3
-from PIL import Image, ImageDraw, ImageOps
-from fastapi import FastAPI, Request, HTTPException
+from PIL import Image, ImageDraw, ImageOps, ImageFont
+from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 import uvicorn
 import edge_tts
@@ -14,6 +14,7 @@ PASSWORD=os.environ.get('CHMURA_PASSWORD','')
 SECRET=os.environ.get('CHMURA_SESSION_SECRET','')
 if not PASSWORD or not SECRET: raise RuntimeError('Set CHMURA_PASSWORD and CHMURA_SESSION_SECRET in Render')
 app=FastAPI(title='Chmura Narratora ZUE')
+logger=logging.getLogger('uvicorn.error')
 jobs={}
 lock=threading.Lock()
 busy=threading.Semaphore(1)
@@ -64,8 +65,15 @@ def clean_text(page):
 async def speak(txt,out,voice=VOICE):
     # Naturalnie brzmiący głos neuronowy online; nie jest żywym lektorem.
     if voice not in VOICES: raise ValueError('Nieznany głos')
-    await edge_tts.Communicate(txt,voice,rate='-4%').save(str(out))
-    if not out.exists() or out.stat().st_size<1000:raise RuntimeError('Nie udało się uzyskać narracji')
+    for attempt in range(3):
+        try:
+            await edge_tts.Communicate(txt,voice,rate='-4%').save(str(out))
+            if not out.exists() or out.stat().st_size<1000:
+                raise RuntimeError('Nie udało się uzyskać narracji')
+            return
+        except Exception:
+            if attempt==2:raise
+            await asyncio.sleep(2*(attempt+1))
 def make_book_spreads(slides,durations,wd,opening_page=None):
     # First spread: optional title page on the left and original PDF cover on the right.
     with Image.open(slides[0]) as sample:
@@ -103,11 +111,42 @@ def make_book_spreads(slides,durations,wd,opening_page=None):
         frame_durations.append(length)
     return frames,frame_durations
 
+def make_default_opening_page(wd,reference):
+    # A golden title page on the left even when the owner did not upload an image.
+    with Image.open(reference) as example:
+        width,height=example.size
+    title=Image.new('RGB',(width,height),(20,21,12))
+    draw=ImageDraw.Draw(title)
+    margin=max(15,round(width*.06))
+    draw.rectangle((margin,margin,width-margin,height-margin),
+                   outline=(214,173,76),width=max(3,width//180))
+    font_path='/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+    for message,y,fraction in (
+        ('NIEKOŃCZĄCA SIĘ',.33,.055),
+        ('KSIĘGA',.43,.085),
+        ('ZUEMA · ZUE',.61,.055),
+        ('Andrzej Muller',.77,.044),
+    ):
+        font=ImageFont.truetype(font_path,max(13,int(width*fraction)))
+        bounds=draw.textbbox((0,0),message,font=font)
+        text_width=bounds[2]-bounds[0]
+        if text_width>width-2*margin:
+            font=ImageFont.truetype(font_path,max(12,int(width*fraction*(width-2*margin)/text_width)))
+            bounds=draw.textbbox((0,0),message,font=font)
+            text_width=bounds[2]-bounds[0]
+        draw.text(((width-text_width)//2,int(height*y)),message,
+                  fill=(255,215,122),font=font)
+    output=wd/'opening_auto.jpg'
+    title.save(output,format='JPEG',quality=84)
+    title.close()
+    return output
+
 def render(job,path,intro,voice=VOICE,custom_recording=None,opening_page=None):
     if not busy.acquire(blocking=False):
         state(job,'Inny wideobook jest właśnie tworzony — spróbuj ponownie później',0);job['error']='Zajęte studio';return
     try:
         wd=ROOT/job['id'];wd.mkdir(exist_ok=True)
+        logger.info('ZUE: start job %s',job['id'])
         pdf=fitz.open(path)
         total=len(pdf);job['pages']=total
         if total>MAX_PAGES: raise RuntimeError(f'Limit {MAX_PAGES} stron na jeden projekt')
@@ -115,6 +154,8 @@ def render(job,path,intro,voice=VOICE,custom_recording=None,opening_page=None):
         first_chapter=next((i for i in range(min(total,20)) if re.search(r'ROZDZIAŁ\s+I\b',pdf[i].get_text(),re.I)),min(total-1,5))
         # For the known book, PDF page 2 = short introduction, pages 3-4 = silent table of contents.
         for i in range(total):
+            if i%10==0:
+                state(job,f'Przygotowanie stron PDF: {i+1} z {total}',round(2+8*i/total))
             page=pdf[i]
             img=wd/f'{i:04d}.jpg'
             pix=page.get_pixmap(matrix=fitz.Matrix(1.15,1.15),alpha=False)
@@ -126,6 +167,7 @@ def render(job,path,intro,voice=VOICE,custom_recording=None,opening_page=None):
             elif i<first_chapter: spoken=''
             else: spoken=clean_text(page)
             texts.append(spoken[:5000])
+            if i%25==0:fitz.TOOLS.store_shrink(100)
         pdf.close()
         if custom_recording:
             probe=subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','default=noprint_wrappers=1:nokey=1',str(custom_recording)],capture_output=True,text=True,timeout=25)
@@ -167,6 +209,7 @@ def render(job,path,intro,voice=VOICE,custom_recording=None,opening_page=None):
         audio=wd/'narracja.mp3'
         ff(['-f','concat','-safe','0','-i',audio_list,'-c','copy',audio])
         state(job,'Składanie stron w otwartą książkę',79)
+        if opening_page is None:opening_page=make_default_opening_page(wd,slides[0])
         slides,durations=make_book_spreads(slides,durations,wd,opening_page)
         slide_list=wd/'images.txt'
         slide_list.write_text(''.join("file '"+slides[i].name+"'\nduration "+str(round(durations[i],3))+"\n" for i in range(len(slides)))+"file '"+slides[-1].name+"'\n")
@@ -174,7 +217,9 @@ def render(job,path,intro,voice=VOICE,custom_recording=None,opening_page=None):
         ff(['-f','concat','-safe','0','-i',slide_list,'-i',audio,'-map','0:v:0','-map','1:a:0','-vsync','vfr','-vf',"scale=w='min(1440,iw)':h=-2:flags=lanczos,pad=ceil(iw/2)*2:ceil(ih/2)*2:0:0:black",'-c:v','libx264','-threads','1','-x264-params','threads=1:lookahead-threads=1','-preset','ultrafast','-crf','29','-pix_fmt','yuv420p','-c:a','aac','-b:a','96k','-movflags','+faststart','-shortest',video])
         state(job,'Gotowy wideobook MP4 i MP3',100)
         job['ready']=True
+        logger.info('ZUE: completed job %s',job['id'])
     except Exception as e:
+        logger.exception('ZUE: failed job %s',job['id'])
         job['error']=str(e);state(job,'Błąd: '+str(e),job.get('progress',0))
     finally:
         gc.collect()
@@ -447,9 +492,13 @@ async def upload(req:Request,intro:str='',voice:str=VOICE,narrator:str='',openin
     threading.Thread(target=render,args=(job,path,intro[:700],voice,custom_path,opening_path),daemon=True).start()
     return {'id':name,'pages':count}
 @app.get('/api/status/{job_id}')
-def status(req:Request,job_id:str):
+def status(req:Request,job_id:str,response:Response):
     auth(req)
     if job_id not in jobs:raise HTTPException(404,'Nie znaleziono projektu')
+    # Keep the private studio signed in while the owner actively monitors a job.
+    issued_at=int(time.time())
+    response.set_cookie('chmura',f"{issued_at}.{cookie_value(issued_at)}",
+                        httponly=True,secure=True,samesite='lax',path='/')
     return jobs[job_id]
 @app.get('/api/download/{job_id}/{kind}')
 def download(req:Request,job_id:str,kind:str):
