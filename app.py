@@ -305,7 +305,7 @@ footer{text-align:center;margin:25px;opacity:.65}</style></head><body><header><h
 <h2>Dodaj całą książkę PDF</h2><p class="muted">Tworzenie wideobooka tylko po ręcznym naciśnięciu przycisku. Dostęp do studia zabezpieczony hasłem.</p>
 <label>Książka PDF — maksymalnie 1000 stron</label><input id="file" type="file" accept=".pdf,application/pdf">
 <label>PIERWSZA STRONA PO LEWEJ — złota strona tytułowa</label><input id="opening-file" type="file" accept="image/png,image/jpeg" onchange="setOpeningPage()">
-<p class="muted" id="opening-status">Wybierz przesłaną złotą stronę tytułową. Program zachowa ją w tej przeglądarce i doda po lewej stronie pierwszej rozkładówki.</p>
+<p class="muted" id="opening-status">Złota strona tytułowa jest opcjonalna. Bez własnego obrazu program sam utworzy złotą stronę po lewej.</p>
 <img id="opening-preview" alt="Podgląd lewej strony tytułowej" style="display:none;max-height:220px;max-width:100%;border:2px solid #c7a04b;margin-top:8px;border-radius:4px">
 <p class="muted"><b>FORMAT KSIĄŻKOWY:</b> otwarta książka z dwiema stronami obok siebie. Okładka pokazuje się jako pierwsza. Narracja czyta strony po kolei, ilustracje i oryginalny PDF pozostają bez zmian.</p>
 <label>Krótki wstęp czytany przez narratora</label><textarea id="intro">Niekończąca się Księga. Oto kolejny tom podróży Zuemy i kosmicznej rasy Zue. Zapraszamy do wysłuchania opowieści.</textarea>
@@ -352,7 +352,7 @@ function showOpeningPage(){
  if(openingPageData.startsWith('data:image/jpeg;base64,')){
   preview.src=openingPageData;preview.style.display='block';
   status.textContent='Złota strona tytułowa gotowa. Będzie po lewej na samym początku każdego nowego wideobooka (w tej przeglądarce).';
- }else{preview.style.display='none';status.textContent='Wybierz złotą stronę tytułową JPG lub PNG — bez niej nie rozpocznie się nowy wideobook.'}
+ }else{preview.style.display='none';status.textContent='Nie wybrano obrazka. Program sam stworzy złotą stronę po lewej.'}
 }
 async function setOpeningPage(){
  const file=document.getElementById('opening-file').files[0];
@@ -415,17 +415,81 @@ initNarrators();
 async function addNarrator(){let f=document.getElementById('narrator-file').files[0],label=document.getElementById('narrator-result');uploadedNarrator='';if(!f){label.textContent='Wybierz plik nagrania lektora';return}if(f.size>250*1024*1024){label.textContent='Nagranie przekracza 250 MB';return}
 let ext=f.name.split('.').pop().toLowerCase();label.textContent='Wgrywanie nagrania lektora...';
 try{let r=await fetch('/api/add-narrator?ext='+encodeURIComponent(ext),{method:'POST',body:f,headers:{'Content-Type':'application/octet-stream'}});let d=await r.json();if(!r.ok)throw Error(d.detail||'Błąd nagrania');uploadedNarrator=d.narrator_id;label.textContent='LEKTOR DODANY — nagranie: '+Math.round(d.duration_seconds/60)+' min. Możesz tworzyć wideobook.'}catch(e){label.textContent=e.message}}
-async function upload(){let f=document.getElementById('file').files[0];if(!f){alert('Najpierw wybierz PDF');return}if(f.size>400*1024*1024){alert('Limit pliku PDF: 400 MB');return}if(!openingPageData){alert('Najpierw wybierz złotą stronę tytułową po lewej');return}
-let selectedVoice=getMode();
-if(selectedVoice==='custom'&&!uploadedNarrator){alert('Najpierw kliknij DODAJ LEKTORA i wgraj całe nagranie książki');return}
-let btn=document.getElementById('create');btn.disabled=true;let s=document.getElementById('status');s.textContent='Dodawanie złotej strony tytułowej po lewej...';try{
-let coverBlob=await (await fetch(openingPageData)).blob();
-let coverRes=await fetch('/api/opening-page',{method:'POST',body:coverBlob,headers:{'Content-Type':'image/jpeg'}});
-let coverInfo=await coverRes.json();if(!coverRes.ok)throw Error(coverInfo.detail||'Błąd strony tytułowej');
-s.textContent='Przesyłanie całego PDF...';
-let res=await fetch('/api/upload?opening_id='+encodeURIComponent(coverInfo.opening_id)+'&intro='+encodeURIComponent(document.getElementById('intro').value)+'&voice='+encodeURIComponent(selectedVoice==='custom'?'pl-PL-MarekNeural':selectedVoice)+'&narrator='+encodeURIComponent(selectedVoice==='custom'?uploadedNarrator:''),{method:'POST',body:f,headers:{'Content-Type':'application/pdf'}});let data=await res.json();if(!res.ok)throw Error(data.detail||'Błąd przesyłania');let id=data.id;
-let timer=setInterval(async()=>{try{let response=await fetch('/api/status/'+id);if(response.status===404){clearInterval(timer);btn.disabled=false;s.textContent='Serwer uruchomił się ponownie i przerwał to zadanie. Uruchom generowanie jeszcze raz.';return}if(response.status===401){clearInterval(timer);btn.disabled=false;s.textContent='Sesja wygasła. Zaloguj się ponownie, aby sprawdzić postęp.';return}if(!response.ok)throw Error('HTTP '+response.status);let x=await response.json();document.getElementById('bar').value=x.progress||0;s.textContent=x.stage||'Przetwarzanie';if(x.ready||x.error){clearInterval(timer);btn.disabled=false;if(x.ready){document.getElementById('links').innerHTML='<a href="/api/download/'+id+'/mp4">POBIERZ WIDEOBOOK MP4</a>'}}}catch(e){s.textContent='Nie można odczytać postępu: '+e.message}},2500)
-}catch(e){s.textContent='Błąd: '+e.message;btn.disabled=false}}
+const jobStorageKey='chmura-zue-last-job-v2';
+let jobTimer=null;
+function rememberJob(id){try{localStorage.setItem(jobStorageKey,id)}catch(e){}}
+function forgetJob(){try{localStorage.removeItem(jobStorageKey)}catch(e){}}
+function trackJob(id){
+ if(jobTimer)clearInterval(jobTimer);
+ const btn=document.getElementById('create'),status=document.getElementById('status');
+ btn.disabled=true;
+ const poll=async()=>{
+  try{
+   const response=await fetch('/api/status/'+id);
+   if(response.status===404){
+    clearInterval(jobTimer);jobTimer=null;forgetJob();btn.disabled=false;
+    status.textContent='Serwer przerwał zadanie lub stracił je po ponownym uruchomieniu. Możesz ponowić generowanie.';return;
+   }
+   if(response.status===401){
+    clearInterval(jobTimer);jobTimer=null;btn.disabled=false;
+    status.textContent='Wymagane ponowne logowanie. Zaloguj się, aby sprawdzić postęp.';return;
+   }
+   if(!response.ok)throw Error('HTTP '+response.status);
+   const x=await response.json();
+   document.getElementById('bar').value=x.progress||0;
+   status.textContent=x.stage||'Przetwarzanie';
+   if(x.ready||x.error){
+    clearInterval(jobTimer);jobTimer=null;btn.disabled=false;
+    if(x.ready){
+     document.getElementById('links').innerHTML='<a href="/api/download/'+id+'/mp4">POBIERZ WIDEOBOOK MP4</a>';
+    }else{
+     forgetJob();
+     status.textContent='Błąd generowania: '+(x.error||'Nieznany błąd');
+    }
+   }
+  }catch(e){status.textContent='Problem z połączeniem: '+e.message+'. Sprawdzę ponownie.'}
+ };
+ poll();
+ jobTimer=setInterval(poll,5000);
+}
+async function upload(){
+ const f=document.getElementById('file').files[0];
+ if(!f){alert('Najpierw wybierz PDF');return}
+ if(f.size>400*1024*1024){alert('Limit pliku PDF: 400 MB');return}
+ const selectedVoice=getMode();
+ if(selectedVoice==='custom'&&!uploadedNarrator){
+  alert('Najpierw kliknij DODAJ LEKTORA i wgraj całe nagranie książki');return;
+ }
+ const btn=document.getElementById('create'),status=document.getElementById('status');
+ btn.disabled=true;
+ document.getElementById('links').innerHTML='';
+ try{
+  let openingId='';
+  if(openingPageData){
+   status.textContent='Dodawanie złotej strony tytułowej po lewej...';
+   const coverBlob=await (await fetch(openingPageData)).blob();
+   const coverRes=await fetch('/api/opening-page',{method:'POST',body:coverBlob,headers:{'Content-Type':'image/jpeg'}});
+   const coverInfo=await coverRes.json();
+   if(!coverRes.ok)throw Error(coverInfo.detail||'Błąd strony tytułowej');
+   openingId=coverInfo.opening_id;
+  }
+  status.textContent='Przesyłanie całego PDF...';
+  const url='/api/upload?opening_id='+encodeURIComponent(openingId)+
+   '&intro='+encodeURIComponent(document.getElementById('intro').value)+
+   '&voice='+encodeURIComponent(selectedVoice==='custom'?'pl-PL-MarekNeural':selectedVoice)+
+   '&narrator='+encodeURIComponent(selectedVoice==='custom'?uploadedNarrator:'');
+  const res=await fetch(url,{method:'POST',body:f,headers:{'Content-Type':'application/pdf'}});
+  const data=await res.json();
+  if(!res.ok)throw Error(data.detail||'Błąd przesyłania');
+  rememberJob(data.id);
+  trackJob(data.id);
+ }catch(e){status.textContent='Błąd: '+e.message;btn.disabled=false}
+}
+try{
+ const previous=localStorage.getItem(jobStorageKey);
+ if(previous&&/^[0-9a-f]{32}$/.test(previous))trackJob(previous);
+}catch(e){}
+
 </script></body></html>'''
 LOGIN='''<!doctype html><html lang="pl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="background:#09222b;color:#f7db88;font:18px system-ui;max-width:480px;margin:13vh auto;padding:24px"><h1>CHMURA NARRATORA ZUE</h1><p>PRYWATNE STUDIO — WEJŚCIE WYŁĄCZNIE NA HASŁO WŁAŚCICIELA</p><form method="post" action="/login"><label for="password">Hasło właściciela</label><input id="password" type="password" name="password" autocomplete="current-password" required style="box-sizing:border-box;width:100%;padding:14px;font-size:20px"><button type="submit" style="width:100%;padding:14px;margin-top:15px;background:#f4cc76">OTWÓRZ STUDIO NA HASŁO</button></form></body></html>'''
 
