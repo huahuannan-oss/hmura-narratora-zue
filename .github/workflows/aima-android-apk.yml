@@ -12,7 +12,11 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
+      - name: Verify Android SDK available on runner
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls -al "$ANDROID_HOME/cmdline-tools" || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --version || sdkmanager --version
       - name: Install SDK
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
       - uses: gradle/actions/setup-gradle@v4
